@@ -48,3 +48,20 @@ Thumbs.db
 *.mov
 *.wmv
 
+
+# Next.js
+.next/
+out/
+.next
+.env*.local
+.env
+
+# TypeScript
+*.tsbuildinfo
+next-env.d.ts
+
+# Vercel
+.vercel
+
+# Original scratch script — kept locally for reference, not checked in
+events.js
