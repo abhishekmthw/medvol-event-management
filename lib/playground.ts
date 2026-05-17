@@ -15,7 +15,31 @@ type SqsAction = "delete" | "changeVisibility";
 export type PlaygroundOutcome =
   | { kind: "success"; raw: string }
   | { kind: "gone"; raw: string }
-  | { kind: "error"; reason: string; raw: string; httpStatus: number };
+  | {
+      kind: "error";
+      reason: string;
+      raw: string;
+      httpStatus: number;
+      curl: string;
+    };
+
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
+function buildCurl(opts: {
+  method: "POST" | "DELETE";
+  url: string;
+  headers: Record<string, string>;
+  body: string;
+}): string {
+  const lines: string[] = [`curl -X ${opts.method} ${shellQuote(opts.url)}`];
+  for (const [k, v] of Object.entries(opts.headers)) {
+    lines.push(`  -H ${shellQuote(`${k}: ${v}`)}`);
+  }
+  if (opts.body) lines.push(`  --data-raw ${shellQuote(opts.body)}`);
+  return lines.join(" \\\n");
+}
 
 const DEFAULT_TIMEOUT_MS = Number(
   process.env.PLAYGROUND_FETCH_TIMEOUT_MS ?? 10_000,
@@ -84,37 +108,40 @@ async function callPlaygroundSqs(
     }
   }
 
+  const url = playgroundUrl(target.environment);
+  const headers = {
+    "x-api-key": playgroundKey(),
+    "Content-Type": "application/json",
+  };
+  const bodyStr = JSON.stringify(body);
+
   const res = await fetchWithTimeout(
-    playgroundUrl(target.environment),
-    {
-      method: "POST",
-      headers: {
-        "x-api-key": playgroundKey(),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    },
+    url,
+    { method: "POST", headers, body: bodyStr },
     DEFAULT_TIMEOUT_MS,
     `Playground SQS ${action}`,
   );
 
   const raw = (await res.text()).trim();
+  const curl = buildCurl({ method: "POST", url, headers, body: bodyStr });
 
   if (!res.ok) {
     return {
       kind: "error",
-      reason: `Playground SQS ${action} returned HTTP ${res.status}: ${raw || "<empty>"}`,
+      reason: `Playground SQS ${action} returned HTTP ${res.status}: ${raw || "<empty>"}\nRequest:\n${curl}`,
       raw,
       httpStatus: res.status,
+      curl,
     };
   }
   if (raw === `"success"`) return { kind: "success", raw };
   if (raw === `"failed"`) return { kind: "gone", raw };
   return {
     kind: "error",
-    reason: `Unexpected Playground SQS ${action} response: ${raw || "<empty>"}`,
+    reason: `Unexpected Playground SQS ${action} response: ${raw || "<empty>"}\nRequest:\n${curl}`,
     raw,
     httpStatus: res.status,
+    curl,
   };
 }
 
@@ -134,26 +161,26 @@ export function refireSqsMessage(
 
 export async function deleteSqsBatchScheduler(
   schedulerName: string,
-): Promise<{ ok: boolean; status: number; raw: string }> {
+): Promise<{ ok: boolean; status: number; raw: string; curl: string }> {
   const url = process.env.PLAYGROUND_SQS_BATCH_API_URL;
   const key = process.env.PLAYGROUND_SQS_BATCH_API_KEY;
   if (!url) throw new Error("Missing PLAYGROUND_SQS_BATCH_API_URL env var");
   if (!key) throw new Error("Missing PLAYGROUND_SQS_BATCH_API_KEY env var");
 
+  const headers = {
+    Authorization: JSON.stringify({ apiKey: key }),
+    "Content-Type": "application/json",
+  };
+  const bodyStr = JSON.stringify({ scheduler_name: schedulerName });
+
   const res = await fetchWithTimeout(
     url,
-    {
-      method: "DELETE",
-      headers: {
-        Authorization: JSON.stringify({ apiKey: key }),
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ scheduler_name: schedulerName }),
-    },
+    { method: "DELETE", headers, body: bodyStr },
     DEFAULT_TIMEOUT_MS,
     "Playground batch scheduler delete",
   );
 
   const raw = await res.text();
-  return { ok: res.ok, status: res.status, raw };
+  const curl = buildCurl({ method: "DELETE", url, headers, body: bodyStr });
+  return { ok: res.ok, status: res.status, raw, curl };
 }

@@ -450,7 +450,7 @@ export async function clearBatchEvents(
       } else {
         errors.push({
           id: row.id,
-          reason: `Scheduler delete failed (HTTP ${res.status}): ${res.raw || "<empty>"}`,
+          reason: `Scheduler delete failed (HTTP ${res.status}): ${res.raw || "<empty>"}\nRequest:\n${res.curl}`,
         });
       }
     } catch (e) {
