@@ -3,18 +3,21 @@ import type { Service } from "./types";
 /**
  * A private DB instance for a service. A "private instance" is a separately
  * deployed copy of a service for a specific company / partner, with its own
- * database and SQS queues. Lupin is the first example; more can be added.
+ * database and SQS queues (in its own AWS account). Lupin is the first
+ * example; more can be added.
  *
  * Registration is purely env-var driven — see `.env.example`:
  *
  *   PRIVATE_INSTANCES=lupin,alpha
  *   PRIVATE_INSTANCE_LUPIN_LABEL=Lupin
  *   PRIVATE_INSTANCE_LUPIN_SERVICE=oms
- *   PRIVATE_INSTANCE_LUPIN_PLAYGROUND_FLAG=isLupin
  *   PRIVATE_INSTANCE_LUPIN_PROD_DB_HOST=…
  *   PRIVATE_INSTANCE_LUPIN_PROD_DB_USER=…
  *   PRIVATE_INSTANCE_LUPIN_PROD_DB_NAME=…
  *   PRIVATE_INSTANCE_LUPIN_PROD_DB_PASSWORD=…
+ *   PRIVATE_INSTANCE_LUPIN_PROD_SQS_QUEUE_URL=…
+ *   PRIVATE_INSTANCE_LUPIN_PROD_AWS_ACCESS_KEY_ID=…
+ *   PRIVATE_INSTANCE_LUPIN_PROD_AWS_SECRET_ACCESS_KEY=…
  *   PRIVATE_INSTANCE_LUPIN_STAGE_DB_HOST=…
  *   …
  */
@@ -22,16 +25,10 @@ export type InstanceMeta = {
   id: string;
   label: string;
   service: Service;
-  /** The JSON key the Playground SQS API expects to route to this instance. */
-  playgroundFlag: string;
 };
 
 function envPrefix(id: string): string {
   return `PRIVATE_INSTANCE_${id.toUpperCase()}`;
-}
-
-function defaultPlaygroundFlag(id: string): string {
-  return `is${id.charAt(0).toUpperCase()}${id.slice(1).toLowerCase()}`;
 }
 
 function parseIds(): string[] {
@@ -70,9 +67,7 @@ function readOne(id: string): InstanceMeta | null {
     );
     return null;
   }
-  const playgroundFlag =
-    process.env[`${prefix}_PLAYGROUND_FLAG`]?.trim() || defaultPlaygroundFlag(id);
-  return { id, label, service: serviceRaw, playgroundFlag };
+  return { id, label, service: serviceRaw };
 }
 
 let cache: InstanceMeta[] | null = null;

@@ -1,9 +1,6 @@
 import { getPool } from "./db";
-import {
-  deleteSqsBatchScheduler,
-  deleteSqsMessage,
-  refireSqsMessage,
-} from "./playground";
+import { deleteSqsBatchScheduler } from "./playground";
+import { deleteSqsMessage, refireSqsMessage } from "./sqs";
 import type {
   BatchStatusRow,
   EventStatusRow,
