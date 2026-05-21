@@ -64,15 +64,46 @@ async function fetchEventStatusRows(
       ecs.sentry_issue_id::text AS sentry_issue_id,
       ecs.sentry_issue_status,
       ecs.error_message,
-      ecs.modified_date,
-      ev.event_type
+      ecs.modified_date
     FROM public.event_consumer_status ecs
-    LEFT JOIN public.events ev ON ev."eventId" = ecs.eventid
     WHERE ${conditions.join(" AND ")}
     ORDER BY ecs.eventid DESC
   `;
   const { rows } = await pool.query(sql, params);
-  return rows as EventStatusRow[];
+  const eventRows = rows as Omit<EventStatusRow, "event_type">[];
+
+  // Resolve event_type in a separate, narrowly-scoped query keyed by the IDs
+  // we actually returned. Joining against public.events in the main query
+  // forced a Seq Scan on a multi-million-row table in prod (the `numeric` cast
+  // on eventid defeated the bigint index on events."eventId"), which is what
+  // caused 504s on the Vercel-hosted UI.
+  if (!eventRows.length) {
+    return eventRows.map((r) => ({ ...r, event_type: null }));
+  }
+
+  const ids = Array.from(new Set(eventRows.map((r) => r.eventid)));
+  const typeMap = new Map<string, string | null>();
+  try {
+    const { rows: typeRows } = await pool.query(
+      `SELECT "eventId"::text AS eventid, event_type
+       FROM public.events
+       WHERE "eventId" = ANY($1::bigint[])`,
+      [ids],
+    );
+    for (const r of typeRows as { eventid: string; event_type: string | null }[]) {
+      typeMap.set(r.eventid, r.event_type);
+    }
+  } catch (e) {
+    console.error(
+      `[fetchEventStatusRows] event_type lookup failed:`,
+      e instanceof Error ? e.message : String(e),
+    );
+  }
+
+  return eventRows.map((r) => ({
+    ...r,
+    event_type: typeMap.get(r.eventid) ?? null,
+  }));
 }
 
 async function markEventForceSuccess(
