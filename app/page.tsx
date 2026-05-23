@@ -24,7 +24,6 @@ import {
   X,
 } from "lucide-react";
 import clsx from "clsx";
-import { MedVolLogo } from "@/components/logo";
 import { ThemeToggle } from "@/components/theme-toggle";
 import {
   ACTIONS,
@@ -214,7 +213,6 @@ export default function DashboardPage() {
       <header className="sticky top-0 z-30 backdrop-blur-md bg-[hsl(var(--background))]/70 border-b border-[hsl(var(--border))]">
         <div className="mx-auto max-w-6xl px-4 sm:px-6 h-14 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <MedVolLogo size={28} />
             <div className="leading-tight">
               <div className="text-sm font-semibold">MedVol</div>
               <div className="text-[11px] uppercase tracking-wider text-[hsl(var(--muted-foreground))]">

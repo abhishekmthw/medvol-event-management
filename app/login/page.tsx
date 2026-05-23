@@ -56,9 +56,11 @@ function LoginInner() {
       </div>
 
       <div className="w-full max-w-sm">
+        <div className="flex justify-center mb-6">
+          <MedVolLogo size={64} />
+        </div>
         <div className="card-strong p-8 animate-slide-up">
           <div className="flex flex-col items-center gap-3 mb-6">
-            <MedVolLogo size={48} />
             <div className="text-center">
               <h1 className="text-xl font-semibold tracking-tight">
                 Event Management
