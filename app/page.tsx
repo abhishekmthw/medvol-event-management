@@ -76,12 +76,32 @@ export default function DashboardPage() {
   const [loggingOut, setLoggingOut] = useState(false);
   const [formatOpen, setFormatOpen] = useState(false);
 
+  const handleSessionExpired = useMemo(
+    () => async () => {
+      try {
+        await fetch("/api/auth/logout", { method: "POST" });
+      } catch {
+        // Logout endpoint is best-effort — middleware will redirect anyway.
+      }
+      const next = window.location.pathname + window.location.search;
+      router.replace(`/login?next=${encodeURIComponent(next)}`);
+      router.refresh();
+    },
+    [router],
+  );
+
   useEffect(() => {
     let cancelled = false;
     fetch("/api/instances")
-      .then((r) => r.json())
+      .then(async (r) => {
+        if (r.status === 401) {
+          if (!cancelled) await handleSessionExpired();
+          return null;
+        }
+        return r.json();
+      })
       .then((d) => {
-        if (cancelled) return;
+        if (cancelled || d === null) return;
         setInstances(Array.isArray(d?.instances) ? d.instances : []);
       })
       .catch(() => {
@@ -90,7 +110,7 @@ export default function DashboardPage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [handleSessionExpired]);
 
   const instancesForService = useMemo(
     () => instances.filter((i) => i.service === service),
@@ -127,6 +147,10 @@ export default function DashboardPage() {
           preview,
         }),
       });
+      if (res.status === 401) {
+        await handleSessionExpired();
+        return null;
+      }
       const data = await res.json();
       if (!res.ok) {
         setTopError(data?.error ?? `Request failed (HTTP ${res.status}).`);
@@ -369,10 +393,15 @@ export default function DashboardPage() {
           </div>
         </section>
 
-        {result && (
-          <ResultsCard result={result} action={action} />
-        )}
       </div>
+
+      {result && (
+        <ResultsModal
+          result={result}
+          action={action}
+          onClose={() => setResult(null)}
+        />
+      )}
 
       {preview && (
         <PreviewModal
@@ -522,70 +551,94 @@ function Segmented<T extends string>({
   );
 }
 
-function ResultsCard({
+function ResultsModal({
   result,
   action,
+  onClose,
 }: {
   result: OperationResult;
   action: ActionKey;
+  onClose: () => void;
 }) {
   const isBatch = action === "clear-batch";
   return (
-    <section className="card p-5 sm:p-6 space-y-4 animate-slide-up">
-      <div className="flex items-start gap-3">
-        {result.ok ? (
-          <CheckCircle2 className="h-5 w-5 text-emerald-500 mt-0.5" />
-        ) : (
-          <CircleAlert className="h-5 w-5 text-[hsl(var(--danger))] mt-0.5" />
-        )}
-        <div className="flex-1">
-          <h2 className="text-sm font-semibold">
-            {result.ok ? "Success" : "Completed with errors"}
-          </h2>
-          <p className="text-sm text-[hsl(var(--muted-foreground))]">
-            {result.message}
-          </p>
-          {action !== "status" && (
-            <div className="flex flex-wrap gap-4 mt-2 text-xs text-[hsl(var(--muted-foreground))]">
-              <span>
-                Attempted: <b className="text-[hsl(var(--foreground))]">{result.attempted}</b>
-              </span>
-              <span>
-                Processed: <b className="text-[hsl(var(--foreground))]">{result.cleared}</b>
-              </span>
-              {typeof result.gone === "number" && result.gone > 0 && (
-                <span title="SQS message was already gone (>15 days) — DB was still force-succeeded.">
-                  SQS expired:{" "}
-                  <b className="text-amber-600 dark:text-amber-400">{result.gone}</b>
-                </span>
-              )}
-              <span>
-                Errors: <b className="text-[hsl(var(--foreground))]">{result.errors.length}</b>
-              </span>
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
+      <div className="card-strong max-w-4xl w-full max-h-[90vh] flex flex-col">
+        <div className="flex items-start gap-3 p-6 pb-3">
+          {result.ok ? (
+            <div className="h-10 w-10 rounded-full flex items-center justify-center shrink-0 bg-emerald-500/15">
+              <CheckCircle2 className="h-5 w-5 text-emerald-500" />
+            </div>
+          ) : (
+            <div className="h-10 w-10 rounded-full flex items-center justify-center shrink-0 bg-[hsl(var(--danger))]/15">
+              <CircleAlert className="h-5 w-5 text-[hsl(var(--danger))]" />
             </div>
           )}
+          <div className="flex-1 min-w-0">
+            <h3 className="text-base font-semibold">
+              {result.ok ? "Success" : "Completed with errors"}
+            </h3>
+            <p className="text-sm text-[hsl(var(--muted-foreground))] mt-1">
+              {result.message}
+            </p>
+            {action !== "status" && (
+              <div className="flex flex-wrap gap-4 mt-2 text-xs text-[hsl(var(--muted-foreground))]">
+                <span>
+                  Attempted: <b className="text-[hsl(var(--foreground))]">{result.attempted}</b>
+                </span>
+                <span>
+                  Processed: <b className="text-[hsl(var(--foreground))]">{result.cleared}</b>
+                </span>
+                {typeof result.gone === "number" && result.gone > 0 && (
+                  <span title="SQS message was already gone (>15 days) — DB was still force-succeeded.">
+                    SQS expired:{" "}
+                    <b className="text-amber-600 dark:text-amber-400">{result.gone}</b>
+                  </span>
+                )}
+                <span>
+                  Errors: <b className="text-[hsl(var(--foreground))]">{result.errors.length}</b>
+                </span>
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            className="btn-ghost h-8 w-8 px-0"
+            onClick={onClose}
+            aria-label="Close"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="px-6 pb-3 space-y-4 overflow-auto flex-1">
+          {result.errors.length > 0 && (
+            <details className="rounded-lg border border-[hsl(var(--danger))]/30 bg-[hsl(var(--danger))]/5 p-3 text-xs">
+              <summary className="cursor-pointer font-medium text-[hsl(var(--danger))]">
+                {result.errors.length} error{result.errors.length === 1 ? "" : "s"}
+              </summary>
+              <ul className="mt-2 space-y-1 max-h-48 overflow-auto">
+                {result.errors.map((err, i) => (
+                  <li key={i} className="font-mono">
+                    <b>{String(err.id)}</b>: {err.reason}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+
+          {isBatch
+            ? <BatchTable rows={result.batch ?? []} />
+            : <EventTable rows={result.events ?? []} />}
+        </div>
+
+        <div className="flex justify-end gap-2 px-6 py-4 border-t border-[hsl(var(--border))]">
+          <button type="button" className="btn-primary" onClick={onClose}>
+            Close
+          </button>
         </div>
       </div>
-
-      {result.errors.length > 0 && (
-        <details className="rounded-lg border border-[hsl(var(--danger))]/30 bg-[hsl(var(--danger))]/5 p-3 text-xs">
-          <summary className="cursor-pointer font-medium text-[hsl(var(--danger))]">
-            {result.errors.length} error{result.errors.length === 1 ? "" : "s"}
-          </summary>
-          <ul className="mt-2 space-y-1 max-h-48 overflow-auto">
-            {result.errors.map((err, i) => (
-              <li key={i} className="font-mono">
-                <b>{String(err.id)}</b>: {err.reason}
-              </li>
-            ))}
-          </ul>
-        </details>
-      )}
-
-      {isBatch
-        ? <BatchTable rows={result.batch ?? []} />
-        : <EventTable rows={result.events ?? []} />}
-    </section>
+    </div>
   );
 }
 

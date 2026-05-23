@@ -51,6 +51,9 @@
         hsla(215, 95%, 53%, 0.08),
         transparent
       );
+    background-repeat: no-repeat;
+    background-attachment: fixed;
+    background-size: 100% 100%;
   }
   .dark body {
     background-image:
