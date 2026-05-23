@@ -539,7 +539,7 @@ function Segmented<T extends string>({
               selected
                 ? opt.danger
                   ? "bg-[hsl(var(--danger))] text-white shadow"
-                  : "bg-[hsl(var(--background))] text-[hsl(var(--foreground))] shadow-sm"
+                  : "bg-[hsl(var(--primary))]/10 text-[hsl(var(--primary))] ring-1 ring-[hsl(var(--primary))] shadow-sm"
                 : "text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))]",
             )}
           >
