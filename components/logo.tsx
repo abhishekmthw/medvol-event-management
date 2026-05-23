@@ -14,7 +14,11 @@ export function MedVolLogo({
       alt="MedVol"
       width={size}
       height={size}
-      className={clsx("object-contain", className)}
+      className={clsx(
+        "object-contain",
+        "dark:[filter:drop-shadow(0_0_1px_rgba(255,255,255,0.9))_drop-shadow(0_0_2px_rgba(255,255,255,0.6))]",
+        className,
+      )}
       style={{ height: size, width: "auto" }}
     />
   );
