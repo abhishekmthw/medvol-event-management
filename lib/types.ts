@@ -169,3 +169,51 @@ export type OperationResult = {
    */
   gone?: number;
 };
+
+/* ------------------------------------------------------------------ *
+ * 24h OTP Block — clears otp_retry_count + lockup_date on the V1 auth
+ * user tables (auth-backend / Corp DB) so a locked-out user can log in.
+ * ------------------------------------------------------------------ */
+
+export type OtpUserType =
+  | "stockist"
+  | "fieldforce"
+  | "counter"
+  | "delegate"
+  | "admin";
+
+/** UI ordering + labels for the user-type selector. Also the allow-list. */
+export const OTP_USER_TYPES: { value: OtpUserType; label: string }[] = [
+  { value: "stockist", label: "Stockist" },
+  { value: "fieldforce", label: "Field Force" },
+  { value: "counter", label: "Counter" },
+  { value: "delegate", label: "Delegate" },
+  { value: "admin", label: "Admin" },
+];
+
+/** A matched user row, with its current OTP-block state. */
+export type OtpBlockRow = {
+  id: string;
+  mobile_no: string | null;
+  /** null for the Counter link table, which has no `name` column. */
+  name: string | null;
+  otp_retry_count: number | null;
+  lockup_date: string | null;
+};
+
+export type OtpBlockResult = {
+  ok: boolean;
+  message: string;
+  /** Rows matched by the supplied mobile number(s). */
+  attempted: number;
+  /** Rows actually updated (otp_retry_count + lockup_date set NULL). */
+  cleared: number;
+  /** Informational notes — e.g. mobile numbers with no matching user. */
+  errors: { mobile: string; reason: string }[];
+  /** Current state of the matched rows (before on preview, after on run). */
+  rows: OtpBlockRow[];
+  /** When true, no mutations were performed; rows shown are candidates. */
+  preview?: boolean;
+  /** Number of rows that would be mutated if executed (preview only). */
+  candidates?: number;
+};

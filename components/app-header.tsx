@@ -10,6 +10,7 @@ import { ThemeToggle } from "@/components/theme-toggle";
 const TABS = [
   { href: "/", label: "Event Ops" },
   { href: "/counter", label: "Counter Events" },
+  { href: "/otp-block", label: "24h OTP Block" },
 ] as const;
 
 /** Sticky app header with section nav tabs, theme toggle and logout. */

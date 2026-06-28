@@ -102,5 +102,66 @@ export function describeTarget(target: Target): string {
   return `${env} • ${svc}`;
 }
 
+/**
+ * Pool for the V1 auth-backend database (the Corp DB shared with
+ * backend_corp_svc, where the user-login tables live). Used by the "24h OTP
+ * Block" tab to clear `otp_retry_count` + `lockup_date` on the per-user-type
+ * tables. Keyed per-environment; creds come from `AUTH_{ENV}_DB_*`. This is a
+ * deliberately separate target from the `corp` service pool so auth-DB access
+ * stays decoupled from the V2 event-store queries.
+ */
+export function getAuthPool(environment: Environment): Pool {
+  const key = `auth:${environment}`;
+  const existing = pools.get(key);
+  if (existing) return existing;
+
+  const prefix = `AUTH_${environment.toUpperCase()}`;
+  const c = creds(prefix);
+  const missing = Object.entries(c)
+    .filter(([, v]) => !v)
+    .map(([k]) => `${prefix}_DB_${k.toUpperCase()}`);
+  if (missing.length) {
+    throw new Error(
+      `Missing database env vars for ${prefix}: ${missing.join(", ")}`,
+    );
+  }
+
+  const pool = new Pool({
+    user: c.user,
+    host: c.host,
+    database: c.database,
+    password: c.password,
+    port: 5432,
+    max: 5,
+    idleTimeoutMillis: 30_000,
+    connectionTimeoutMillis: 10_000,
+  });
+
+  pool.on("error", (err) => {
+    console.error(`[db pool ${key}] idle client error`, err.message);
+  });
+
+  pools.set(key, pool);
+  return pool;
+}
+
+/**
+ * The Postgres schema (search_path) the auth-backend tables live in for this
+ * env. auth-backend sets it via `POSTGRES_SCHEMA`, which may not be `public`,
+ * so the OTP-block queries schema-qualify their table. Defaults to `public`.
+ * Validated to a bare SQL identifier because it is interpolated into the query
+ * text (the table names themselves are fixed internal constants).
+ */
+export function authSchema(environment: Environment): string {
+  const raw = process.env[`AUTH_${environment.toUpperCase()}_DB_SCHEMA`];
+  const schema = (raw ?? "").trim() || "public";
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(schema)) {
+    throw new Error(
+      `Invalid AUTH_${environment.toUpperCase()}_DB_SCHEMA "${schema}" — must be a bare SQL identifier.`,
+    );
+  }
+  return schema;
+}
+
 // Re-export for legacy imports
 export type { Environment, Service, Target };

@@ -9,7 +9,7 @@
 
 **Type:** Internal Web App (Next.js 14, App Router)
 **Status:** Production
-**Entry point:** `app/page.tsx` (Event Ops dashboard) — protected by `middleware.ts`; auth lives in `app/login/page.tsx`. A second tab `app/counter/page.tsx` (**Counter Events**) is reachable from the shared header nav.
+**Entry point:** `app/page.tsx` (Event Ops dashboard) — protected by `middleware.ts`; auth lives in `app/login/page.tsx`. Two more tabs are reachable from the shared header nav: `app/counter/page.tsx` (**Counter Events**, read-only) and `app/otp-block/page.tsx` (**24h OTP Block**, clears OTP lockouts in the auth DB).
 **Hosting:** GitHub repo `abhishekmthw/medvol-event-management`. No CI config in-tree (no `.github/`, no `Dockerfile`, no Pulumi). `.gitignore` lists `.vercel/`, suggesting Vercel deployment.
 
 ## Purpose
@@ -22,6 +22,8 @@ Mutations are performed by:
 - Outbound calls to the external **Playground batch scheduler API** to delete EventBridge schedulers for batch retry rows.
 
 A second, **read-only** tab — **Counter Events** (`app/counter/page.tsx`) — browses the raw `public.events` event store in the **Corp DB** (stage/prod) to reconstruct historical counter master changes (division / products / stockist) per stream. It performs **no writes** (no SQS, no Playground); it only `SELECT`s from `public.events` (joined to Corp master tables for enrichment). See "Counter Events" below.
+
+A third tab — **24h OTP Block** (`app/otp-block/page.tsx`) — clears the 24-hour OTP lockout for a user by setting `otp_retry_count` and `lockup_date` to `NULL` on the relevant V1 auth table. It connects to a dedicated **auth DB** target (stage/prod), supports a user-type selector (stockist / field force / counter / delegate / admin) and batch mobile-number input, and uses the same preview-before-mutate + confirm flow as the Event Ops actions. See "24h OTP Block" below.
 
 ## Tech Stack
 
@@ -50,15 +52,19 @@ A second, **read-only** tab — **Counter Events** (`app/counter/page.tsx`) — 
 | `app/api/counter/divisions/route.ts` | `GET ?environment=&company=` — divisions from `companydivision_dtl` scoped to the company (cascaded dropdown). |
 | `app/api/counter/query/route.ts` | `POST {environment, view, streamIds, companyCode?, divisionCode?, locationCode?, fromDate?, toDate?}` — validates, parses stream IDs (`parseList`), forces Corp target, dispatches to `lib/counter.ts`, returns `CounterQueryResult`. |
 | `lib/counter.ts` | Counter Events queries (READ-ONLY, Corp-only). `COUNTER_COLUMNS` (per-view column defs), `queryCounterEvents` (per-view parameterized SQL builders with optional filters + `LIMIT 1000`), `fetchCompanies`, `fetchDivisions`. |
+| `app/otp-block/page.tsx` | **24h OTP Block** tab. Environment (stage/prod) + User Type (stockist / field force / counter / delegate / admin) selectors, batch mobile-number textarea, preview-before-mutate + confirm flow, results via `OtpBlockTable`. |
+| `app/api/otp-block/run/route.ts` | `POST {environment, userType, input, preview}` — validates env + user type (`isOtpUserType`) + non-empty input, dispatches to `clearOtpBlock`, returns `OtpBlockResult`. |
+| `lib/otp-block.ts` | 24h OTP Block logic. `USER_TYPES` (user type → case-sensitive table + `hasName`), `isOtpUserType` guard, `clearOtpBlock` (preview = SELECT only; run = `UPDATE … SET otp_retry_count = NULL, lockup_date = NULL WHERE mobile_no = ANY($1::text[])` then re-SELECT). Schema-qualified, parameterized. |
+| `components/otp-block-table.tsx` | Results/candidates table for the OTP Block tab (id, mobile, name, otp_retry_count, lockup_date, blocked/clear state). |
 | `lib/auth.ts` | `createSessionToken`, `verifySessionToken`, `verifyStaticCredentials` (timing-safe). Requires `AUTH_JWT_SECRET` ≥ 32 chars. |
-| `lib/db.ts` | `getPool(target)` — resolves env prefix `{SERVICE}_{ENV}` or `PRIVATE_INSTANCE_{ID}_{ENV}`, builds and caches a `pg.Pool`, validates required vars at first use. |
+| `lib/db.ts` | `getPool(target)` — resolves env prefix `{SERVICE}_{ENV}` or `PRIVATE_INSTANCE_{ID}_{ENV}`, builds and caches a `pg.Pool`, validates required vars at first use. Also `getAuthPool(env)` (auth DB, prefix `AUTH_{ENV}`) and `authSchema(env)` (`AUTH_{ENV}_DB_SCHEMA`, default `public`, validated identifier) for the 24h OTP Block tab. |
 | `lib/instances.ts` | Reads `PRIVATE_INSTANCES` (comma-sep ids) and per-instance `_LABEL` / `_SERVICE` env vars. |
 | `lib/events.ts` | All event-store DB queries + action orchestration. Helpers: `parseList`, `partitionIdentifiers` (numeric → eventIds, non-numeric → streamIds). Actions: `checkStatus`, `clearByEventIds`, `refireByEventIds`, `clearByStreamIds`, `clearBatchEvents`. Each destructive action supports a `preview` mode that returns candidates without writes. |
 | `lib/sqs.ts` | Direct AWS SDK SQS client — `deleteSqsMessage` and `refireSqsMessage`. Resolves queue URL + region + credentials per target: shared uses per-env vars (`{ENV}_AWS_*`, `{SERVICE}_{ENV}_SQS_QUEUE_URL`); each private instance uses per-instance creds (`PRIVATE_INSTANCE_{ID}_AWS_*`, shared across stage and prod since the instance lives in one AWS account) with per-env queue URLs (`PRIVATE_INSTANCE_{ID}_{ENV}_SQS_QUEUE_URL`). Maps known "receipt invalid" errors (`ReceiptHandleIsInvalid`, `InvalidParameterValue`, `MessageNotInflight`, `InvalidIdFormat`) to a `gone` outcome; other AWS errors surface with `queueUrl`, `region`, `httpStatus`, `requestId` in the reason. |
 | `lib/playground.ts` | HTTPS client for the Playground batch scheduler API only (`DELETE {scheduler_name}` with `Authorization: {"apiKey":"…"}`). Honors `PLAYGROUND_FETCH_TIMEOUT_MS` (default 10s) with `AbortController`. Returns the request as a reproducible curl on error. The SQS half of this file was migrated to direct AWS SDK calls — see `lib/sqs.ts`. |
 | `lib/rate-limit.ts` | IP-bucket failure counter + lockout state. Keys by `x-forwarded-for[0]` → `x-real-ip` → `"unknown"`. |
 | `lib/types.ts` | Action keys + `ACTIONS` metadata (labels, placeholders, hints, `danger` flag), row types (`EventStatusRow`, `BatchStatusRow`), `OperationResult`, `Target`, and Counter Events types (`CounterView`, `CounterColumn`, `CounterFilters`, `CounterQueryResult`, `CounterOption`). |
-| `components/app-header.tsx` | Shared sticky header with the section nav tabs (`Event Ops` → `/`, `Counter Events` → `/counter`), theme toggle and logout. Used by both pages. |
+| `components/app-header.tsx` | Shared sticky header with the section nav tabs (`Event Ops` → `/`, `Counter Events` → `/counter`, `24h OTP Block` → `/otp-block`), theme toggle and logout. Used by all pages. |
 | `components/segmented.tsx` | Shared `Segmented<T>` tab-style single-select control (lifted out of `page.tsx`). |
 | `components/format-ids-modal.tsx` | Shared `FormatIdsModal` paste-to-CSV helper (lifted out of `page.tsx`). |
 | `components/counter-table.tsx` | Generic, column-driven results table for Counter Events (columns vary per view, unlike the fixed `EventTable`/`BatchTable`). |
@@ -107,6 +113,25 @@ A second tab (`app/counter/page.tsx`, `lib/counter.ts`) for **auditing historica
 - **Safeguards:** every query is parameterized (no interpolation) and capped at `LIMIT 1000` (`truncated` flag surfaces a "showing first 1000" badge). The mandatory, most-selective predicate is the stream id — performance assumes an index on `events."eventStreamStreamId"` (verify on prod; the same table already caused a documented seq-scan 504 for the `event_type` lookup in `lib/events.ts`).
 - **Caveat:** an item mapped to multiple divisions multiplies product rows (one per slab × division).
 
+## 24h OTP Block (auth DB write)
+
+A third tab (`app/otp-block/page.tsx`, `lib/otp-block.ts`) that **clears the 24-hour OTP lockout** for a user. When a user fails OTP login 5 times, the auth-backend (`PUT /updateOTPAttempts`) sets `otp_retry_count = 5` and `lockup_date = now + 1 day` on that user's table. This tab NULLs both columns so the user can log in again.
+
+- **Target:** dedicated **auth DB** (the V1 auth-backend / Corp DB), selected by **environment** (stage / prod). Separate from the `corp`/`oms` service pools — uses `getAuthPool(env)` with `AUTH_{ENV}_DB_*` creds, and `authSchema(env)` (`AUTH_{ENV}_DB_SCHEMA`, default `public`) because the auth-backend's tables may live in a non-public `POSTGRES_SCHEMA`.
+- **User type** selector maps to the table holding that type's OTP state (all share `otp_retry_count`, `lockup_date`, `mobile_no`):
+
+  | User Type | Table |
+  |---|---|
+  | Stockist | `Stockists` (NOT `Stockist_Dtl`) |
+  | Field Force | `Field_Force_Users` |
+  | Counter | `Counter_Company_Lnk` (one mobile can match several rows — one per company) |
+  | Delegate | `Delegate_Users` |
+  | Admin | `Admin_Users` |
+
+- **Input:** one or more mobile numbers (comma/space/newline separated via `parseList`), matched exactly against `mobile_no`.
+- **Flow:** preview runs a SELECT and shows the matched rows + their current block state; on confirm, a single `UPDATE … SET otp_retry_count = NULL, lockup_date = NULL WHERE mobile_no = ANY($1::text[])` runs, then a re-SELECT shows the post-state. Prod renders the confirm button in danger red, same as the Event Ops destructive actions.
+- **Safety:** table names are fixed internal constants and the schema is a validated bare identifier; only mobile numbers are interpolated, and always as a parameterized `text[]`. Mobiles with no matching row are surfaced as informational notes, not failures.
+
 ## Environment Variables
 
 | Variable | Purpose |
@@ -130,6 +155,9 @@ A second tab (`app/counter/page.tsx`, `lib/counter.ts`) for **auditing historica
 | `CORP_STAGE_DB_HOST` / `_USER` / `_PASSWORD` / `_NAME` | Corp stage DB. |
 | `OMS_PROD_DB_HOST` / `_USER` / `_PASSWORD` / `_NAME` | OMS production (shared instance) DB. |
 | `OMS_STAGE_DB_HOST` / `_USER` / `_PASSWORD` / `_NAME` | OMS stage (shared instance) DB. |
+| `AUTH_PROD_DB_HOST` / `_USER` / `_PASSWORD` / `_NAME` | Auth DB (V1 auth-backend / Corp DB) production — used only by the 24h OTP Block tab. |
+| `AUTH_STAGE_DB_HOST` / `_USER` / `_PASSWORD` / `_NAME` | Auth DB stage. |
+| `AUTH_PROD_DB_SCHEMA` / `AUTH_STAGE_DB_SCHEMA` | Optional Postgres schema for the auth tables (default `public`). Set if auth-backend uses a non-public `POSTGRES_SCHEMA` for that env. |
 | `PRIVATE_INSTANCES` | Comma-separated lowercase ids of private instances to register (e.g. `lupin` or `lupin,alpha`). |
 | `PRIVATE_INSTANCE_{ID}_LABEL` | Human-readable instance name shown in the UI (e.g. `Lupin`). |
 | `PRIVATE_INSTANCE_{ID}_SERVICE` | `corp` or `oms`. |
@@ -158,6 +186,7 @@ A second tab (`app/counter/page.tsx`, `lib/counter.ts`) for **auditing historica
   - `public.events` — **(Event Ops)** joined left for `event_type` only (lookup via `events."eventId" = event_consumer_status.eventid`). **(Counter Events)** read in full per stream: `data` (jsonb), `event_type`, `timestamp`, `"eventId"`, `"eventStreamStreamId"` — never written.
   - `public.batch_event_status` — V2 batch tracking. Reads `id, batch_id, batch_sequence, event_type, event_status, force_status, data, modified_date`. Updates `event_status = 'Success'`, `"force_status" = true` on `clear-batch`.
   - **Counter Events read-only joins (Corp DB):** `company_hdr`, `companydivision_dtl` (dropdowns); `companyproduct_hdr`, `item_divisiondtl`, `companydivision_dtl` (products enrichment); `emp_position_hdr`, `empmaster_hdr` (division employee); `StockistCluster_Lnk`, `StockistCompany_Lnk`, `cluster_hdr` (stockist). Never written.
+  - **24h OTP Block (auth DB):** `"Stockists"`, `"Field_Force_Users"`, `"Counter_Company_Lnk"`, `"Delegate_Users"`, `"Admin_Users"` (case-sensitive, schema-qualified). Reads `id, mobile_no, name, otp_retry_count, lockup_date`; updates `otp_retry_count = NULL, lockup_date = NULL` on clear. Separate `getAuthPool(env)` connection.
 - **Pool config:** `max: 5`, `idleTimeoutMillis: 30_000`, `connectionTimeoutMillis: 10_000`. One pool per `(env, service, instance)` cached for process lifetime.
 
 ## External Integrations
