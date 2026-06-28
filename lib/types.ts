@@ -217,3 +217,103 @@ export type OtpBlockResult = {
   /** Number of rows that would be mutated if executed (preview only). */
   candidates?: number;
 };
+
+/* ------------------------------------------------------------------ *
+ * Auth Details Comparison — READ-ONLY three-way reconciliation of
+ * field-force employees across the auth DB (Field_Force_Users), the
+ * corp DB (empmaster_hdr) and AWS Cognito. Compares name, short code,
+ * mobile number and cognito id. No writes anywhere.
+ * ------------------------------------------------------------------ */
+
+/** Which employees to include in the comparison. */
+export type EmployeeScope = "active" | "all";
+
+export const EMPLOYEE_SCOPES: { value: EmployeeScope; label: string }[] = [
+  { value: "active", label: "Active only" },
+  { value: "all", label: "All employees" },
+];
+
+/** A field-force employee row from the auth DB (`Field_Force_Users`). */
+export type AuthEmployeeRow = {
+  id: string;
+  short_code: string | null;
+  name: string | null;
+  mobile_no: string | null;
+  cognito_id: string | null;
+  active_status: string | null;
+};
+
+/** A field-force employee row from the corp DB (`empmaster_hdr`). */
+export type CorpEmployeeRow = {
+  empmaster_id: string;
+  emp_shortcode: string | null;
+  emp_name: string | null;
+  mobile_no: string | null;
+  cognito_id: string | null;
+  active_status: string | null;
+};
+
+/** A Cognito user parsed from a `ListUsers` result. */
+export type CognitoUserInfo = {
+  sub: string | null;
+  name: string | null;
+  phone_number: string | null;
+  username: string | null;
+  status: string | null;
+  enabled: boolean | null;
+};
+
+/** Cognito enrichment attached to one comparison record. */
+export type CognitoLookup = {
+  /** False when the lookup was skipped (cognito_id null in both DBs). */
+  checked: boolean;
+  /** Why the lookup was skipped, when `checked` is false. */
+  skippedReason?: string;
+  /** Users matched by `phone_number = "+91<mobile>"`. */
+  byMobile: CognitoUserInfo[];
+  /** Users matched by `sub = "<cognito_id>"`, per distinct stored cognito_id. */
+  bySub: { cognitoId: string; users: CognitoUserInfo[] }[];
+  /** Non-fatal error encountered while querying Cognito for this record. */
+  error?: string;
+};
+
+/** Per-field disagreement flags between auth and corp. */
+export type AuthComparisonFlags = {
+  presentInAuth: boolean;
+  presentInCorp: boolean;
+  /** Both present and `name` differs (case-insensitive). */
+  nameMismatch: boolean;
+  /** Both present and normalized mobile differs. */
+  mobileMismatch: boolean;
+  /** Both present and `cognito_id` differs (incl. one null / one set). */
+  cognitoIdMismatch: boolean;
+  /** cognito_id is null/empty in BOTH DBs — the expected-consistent state. */
+  bothCognitoNull: boolean;
+};
+
+/** One reconciled employee across the three sources. */
+export type AuthComparisonRow = {
+  /** Match key (employee short code). */
+  key: string;
+  auth: AuthEmployeeRow | null;
+  corp: CorpEmployeeRow | null;
+  cognito: CognitoLookup;
+  flags: AuthComparisonFlags;
+  /** True if presence differs or any compared field disagrees (auth vs corp). */
+  inconsistent: boolean;
+  /** Human-readable status chips (e.g. "Missing in auth", "cognito_id mismatch"). */
+  statuses: string[];
+};
+
+export type AuthComparisonResult = {
+  ok: boolean;
+  message: string;
+  mode: "single" | "bulk";
+  environment: Environment;
+  scope: EmployeeScope;
+  /** Bulk mode: total inconsistent records found before truncation. */
+  totalInconsistent?: number;
+  /** Bulk mode: true when results were capped at the limit. */
+  truncated?: boolean;
+  rows: AuthComparisonRow[];
+};

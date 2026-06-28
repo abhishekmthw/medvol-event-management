@@ -11,6 +11,7 @@ const TABS = [
   { href: "/", label: "Event Ops" },
   { href: "/counter", label: "Counter Events" },
   { href: "/otp-block", label: "24h OTP Block" },
+  { href: "/auth-comparison", label: "Auth Details Comparison" },
 ] as const;
 
 /** Sticky app header with section nav tabs, theme toggle and logout. */

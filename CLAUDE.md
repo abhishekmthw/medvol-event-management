@@ -9,7 +9,7 @@
 
 **Type:** Internal Web App (Next.js 14, App Router)
 **Status:** Production
-**Entry point:** `app/page.tsx` (Event Ops dashboard) — protected by `middleware.ts`; auth lives in `app/login/page.tsx`. Two more tabs are reachable from the shared header nav: `app/counter/page.tsx` (**Counter Events**, read-only) and `app/otp-block/page.tsx` (**24h OTP Block**, clears OTP lockouts in the auth DB).
+**Entry point:** `app/page.tsx` (Event Ops dashboard) — protected by `middleware.ts`; auth lives in `app/login/page.tsx`. Three more tabs are reachable from the shared header nav: `app/counter/page.tsx` (**Counter Events**, read-only), `app/otp-block/page.tsx` (**24h OTP Block**, clears OTP lockouts in the auth DB), and `app/auth-comparison/page.tsx` (**Auth Details Comparison**, read-only — reconciles field-force employees across the auth DB, corp DB and Cognito).
 **Hosting:** GitHub repo `abhishekmthw/medvol-event-management`. No CI config in-tree (no `.github/`, no `Dockerfile`, no Pulumi). `.gitignore` lists `.vercel/`, suggesting Vercel deployment.
 
 ## Purpose
@@ -25,13 +25,15 @@ A second, **read-only** tab — **Counter Events** (`app/counter/page.tsx`) — 
 
 A third tab — **24h OTP Block** (`app/otp-block/page.tsx`) — clears the 24-hour OTP lockout for a user by setting `otp_retry_count` and `lockup_date` to `NULL` on the relevant V1 auth table. It connects to a dedicated **auth DB** target (stage/prod), supports a user-type selector (stockist / field force / counter / delegate / admin) and batch mobile-number input, and uses the same preview-before-mutate + confirm flow as the Event Ops actions. See "24h OTP Block" below.
 
+A fourth, **read-only** tab — **Auth Details Comparison** (`app/auth-comparison/page.tsx`) — reconciles **field-force employees** across three sources that drift out of sync: the **auth DB** (`Field_Force_Users`, via `getAuthPool`), the **corp DB** (`empmaster_hdr`, via the `corp` service pool), and **AWS Cognito** (`ListUsers` only). It compares employee **name, short code, mobile number and cognito id**. With a mobile number it does a single three-way lookup; with the field blank it scans for the first 100 employees whose auth/corp records differ and enriches those with Cognito. No writes anywhere. See "Auth Details Comparison" below.
+
 ## Tech Stack
 
 - **Runtime:** Node.js (Next.js 14 App Router, `runtime = "nodejs"` on every API route — required because `pg` is not edge-compatible).
 - **Language:** TypeScript (strict, ES2022 target, bundler module resolution).
 - **UI:** React 18, Tailwind CSS, `lucide-react` icons, `next-themes` for dark mode, custom `card` / `btn-primary` / `btn-danger` / `btn-ghost` / `pill` / `input-base` component classes in `app/globals.css`.
 - **DB:** PostgreSQL via `pg` (`Pool`, port 5432, max 5, 30s idle, 10s connect timeout). One pool per `(env, service, instance)` cached in-memory.
-- **AWS:** `@aws-sdk/client-sqs` v3 for `DeleteMessage` / `ChangeMessageVisibility`. One `SQSClient` per `(env, instance)` cached in-memory; credentials passed explicitly per target.
+- **AWS:** `@aws-sdk/client-sqs` v3 for `DeleteMessage` / `ChangeMessageVisibility`. One `SQSClient` per `(env, instance)` cached in-memory; credentials passed explicitly per target. `@aws-sdk/client-cognito-identity-provider` v3 for read-only `ListUsers` (Auth Details Comparison tab); one client per env, same explicit-credential pattern.
 - **Auth:** `jose` HS256 JWT in an httpOnly `em_session` cookie (24h TTL), gated by a single static username/password pair stored in env vars. Verification uses timing-safe equality.
 - **Rate limit:** In-memory IP bucket (5 failures / 15 min window → 5 min lockout). Lives in process memory only — restarts reset.
 
@@ -56,6 +58,11 @@ A third tab — **24h OTP Block** (`app/otp-block/page.tsx`) — clears the 24-h
 | `app/api/otp-block/run/route.ts` | `POST {environment, userType, input, preview}` — validates env + user type (`isOtpUserType`) + non-empty input, dispatches to `clearOtpBlock`, returns `OtpBlockResult`. |
 | `lib/otp-block.ts` | 24h OTP Block logic. `USER_TYPES` (user type → case-sensitive table + `hasName`), `isOtpUserType` guard, `clearOtpBlock` (preview = SELECT only; run = `UPDATE … SET otp_retry_count = NULL, lockup_date = NULL WHERE mobile_no = ANY($1::text[])` then re-SELECT). Schema-qualified, parameterized. |
 | `components/otp-block-table.tsx` | Results/candidates table for the OTP Block tab (id, mobile, name, otp_retry_count, lockup_date, blocked/clear state). |
+| `app/auth-comparison/page.tsx` | **Auth Details Comparison** tab. Environment (stage/prod) + Scope (Active only / All employees) selectors, optional mobile-number input. Read-only — empty mobile runs the bulk top-100 inconsistency scan; a mobile runs a single lookup. Renders `AuthComparisonTable` inline (no preview/confirm). |
+| `app/api/auth-comparison/fetch/route.ts` | `POST {environment, mobile?, scope}` — validates env + scope (`isEmployeeScope`); dispatches to `compareByMobile` (mobile present) or `scanInconsistent` (blank). Returns `AuthComparisonResult`. |
+| `lib/auth-comparison.ts` | Auth/Corp/Cognito reconciliation (READ-ONLY). Fetches `Field_Force_Users` (auth pool) + `empmaster_hdr` (corp pool) with optional `active_status = 'Y'` filter, joins by short code in Node, diffs name/mobile/cognito_id, and enriches with Cognito (bounded concurrency). `normalizeMobile`, `compareByMobile`, `scanInconsistent`, `isEmployeeScope`. |
+| `lib/cognito.ts` | Read-only Cognito client (`@aws-sdk/client-cognito-identity-provider`), cached per env. `lookupByMobile` (filter `phone_number = "+91…"`) and `lookupBySub` (filter `sub = "…"`); reuses `{ENV}_AWS_*` creds + `{ENV}_COGNITO_USERPOOL_ID`. Only `ListUsers` — never any write. |
+| `components/auth-comparison-table.tsx` | Three-way results table — one row per employee with auth/corp/cognito values stacked per field; mismatching cells tinted red; status chips per row. |
 | `lib/auth.ts` | `createSessionToken`, `verifySessionToken`, `verifyStaticCredentials` (timing-safe). Requires `AUTH_JWT_SECRET` ≥ 32 chars. |
 | `lib/db.ts` | `getPool(target)` — resolves env prefix `{SERVICE}_{ENV}` or `PRIVATE_INSTANCE_{ID}_{ENV}`, builds and caches a `pg.Pool`, validates required vars at first use. Also `getAuthPool(env)` (auth DB, prefix `AUTH_{ENV}`) and `authSchema(env)` (`AUTH_{ENV}_DB_SCHEMA`, default `public`, validated identifier) for the 24h OTP Block tab. |
 | `lib/instances.ts` | Reads `PRIVATE_INSTANCES` (comma-sep ids) and per-instance `_LABEL` / `_SERVICE` env vars. |
@@ -132,6 +139,23 @@ A third tab (`app/otp-block/page.tsx`, `lib/otp-block.ts`) that **clears the 24-
 - **Flow:** preview runs a SELECT and shows the matched rows + their current block state; on confirm, a single `UPDATE … SET otp_retry_count = NULL, lockup_date = NULL WHERE mobile_no = ANY($1::text[])` runs, then a re-SELECT shows the post-state. Prod renders the confirm button in danger red, same as the Event Ops destructive actions.
 - **Safety:** table names are fixed internal constants and the schema is a validated bare identifier; only mobile numbers are interpolated, and always as a parameterized `text[]`. Mobiles with no matching row are surfaced as informational notes, not failures.
 
+## Auth Details Comparison (read-only)
+
+A fourth tab (`app/auth-comparison/page.tsx`, `lib/auth-comparison.ts`, `lib/cognito.ts`) that **reconciles field-force employees** across three sources that have drifted out of sync. It does **no writes** — only `SELECT`s and Cognito `ListUsers`.
+
+- **Sources & pools:**
+  - **auth** — `Field_Force_Users` via `getAuthPool(env)` + `authSchema(env)` (the same dedicated auth-DB connection the OTP Block tab uses).
+  - **corp** — `empmaster_hdr` via the existing `corp` service pool (`getPool({env, service:"corp", instance:null})` — the same table the Counter Events division view joins to).
+  - **cognito** — `lib/cognito.ts`, `ListUsers` against the field-force user pool (`{ENV}_COGNITO_USERPOOL_ID`), reusing the SQS section's `{ENV}_AWS_*` credentials.
+- **Why join in Node, not SQL:** auth and corp are reached through separately-configured pools that may point at different databases, so a cross-DB SQL join is unsafe. Each set is fetched independently and joined in application code by **employee short code** (`auth.short_code` = `corp.emp_shortcode`). Volume (field-force employees) is small enough for an internal tool.
+- **Compared fields:** employee **name** (`name` / `emp_name`), **short code** (`short_code` / `emp_shortcode`, the join key), **mobile number** (normalized to last 10 digits — auth `mobile_no` is varchar, corp `mobile_no` is `numeric(10)`, Cognito stores `+91…`), and **cognito id** (`cognito_id` vs the live Cognito `sub`).
+- **Scope selector:** `Active only` filters both tables on `active_status = 'Y'` (both DBs use `'Y'`/`'N'`); `All employees` drops the filter.
+- **Two modes:**
+  - **Mobile entered** → single lookup: query both DBs by `mobile_no`, pair, compare, enrich with Cognito.
+  - **Mobile blank** → bulk scan: fetch all (scoped) employees from both DBs, join by short code, flag a record inconsistent if it exists in only one DB **or** name/mobile/cognito_id differ ("any difference"), take the **first 100** (deterministic, short-code sorted), then enrich those with Cognito.
+- **Cognito-id rule:** if `cognito_id` is null in **both** DBs that is the expected/consistent state → **skip** the Cognito lookup. Otherwise look the user up **twice** — by mobile (`phone_number = "+91<mobile>"`) and by each distinct stored sub (`sub = "<cognito_id>"`) — and cross-check whether the live sub for the mobile matches the stored cognito_ids and whether the user found by sub maps back to the same mobile. Findings surface as per-row status chips.
+- **Safety:** the auth schema is a validated identifier and table names are fixed constants; mobiles are parameterized; Cognito `ListUsers` filter values are quote-escaped. Cognito calls run in bounded-concurrency batches (6) and a per-record failure is captured on that record, never aborting the scan.
+
 ## Environment Variables
 
 | Variable | Purpose |
@@ -158,6 +182,7 @@ A third tab (`app/otp-block/page.tsx`, `lib/otp-block.ts`) that **clears the 24-
 | `AUTH_PROD_DB_HOST` / `_USER` / `_PASSWORD` / `_NAME` | Auth DB (V1 auth-backend / Corp DB) production — used only by the 24h OTP Block tab. |
 | `AUTH_STAGE_DB_HOST` / `_USER` / `_PASSWORD` / `_NAME` | Auth DB stage. |
 | `AUTH_PROD_DB_SCHEMA` / `AUTH_STAGE_DB_SCHEMA` | Optional Postgres schema for the auth tables (default `public`). Set if auth-backend uses a non-public `POSTGRES_SCHEMA` for that env. |
+| `PROD_COGNITO_USERPOOL_ID` / `STAGE_COGNITO_USERPOOL_ID` | Field-force Cognito user pool id per env — used by the Auth Details Comparison tab's `ListUsers` lookups. AWS creds/region are reused from `{ENV}_AWS_*` (above); those IAM creds must also have `cognito-idp:ListUsers` on the pool. |
 | `PRIVATE_INSTANCES` | Comma-separated lowercase ids of private instances to register (e.g. `lupin` or `lupin,alpha`). |
 | `PRIVATE_INSTANCE_{ID}_LABEL` | Human-readable instance name shown in the UI (e.g. `Lupin`). |
 | `PRIVATE_INSTANCE_{ID}_SERVICE` | `corp` or `oms`. |
@@ -187,12 +212,14 @@ A third tab (`app/otp-block/page.tsx`, `lib/otp-block.ts`) that **clears the 24-
   - `public.batch_event_status` — V2 batch tracking. Reads `id, batch_id, batch_sequence, event_type, event_status, force_status, data, modified_date`. Updates `event_status = 'Success'`, `"force_status" = true` on `clear-batch`.
   - **Counter Events read-only joins (Corp DB):** `company_hdr`, `companydivision_dtl` (dropdowns); `companyproduct_hdr`, `item_divisiondtl`, `companydivision_dtl` (products enrichment); `emp_position_hdr`, `empmaster_hdr` (division employee); `StockistCluster_Lnk`, `StockistCompany_Lnk`, `cluster_hdr` (stockist). Never written.
   - **24h OTP Block (auth DB):** `"Stockists"`, `"Field_Force_Users"`, `"Counter_Company_Lnk"`, `"Delegate_Users"`, `"Admin_Users"` (case-sensitive, schema-qualified). Reads `id, mobile_no, name, otp_retry_count, lockup_date`; updates `otp_retry_count = NULL, lockup_date = NULL` on clear. Separate `getAuthPool(env)` connection.
+  - **Auth Details Comparison (read-only):** `"Field_Force_Users"` (auth DB via `getAuthPool` — reads `id, short_code, name, mobile_no, cognito_id, active_status`) and `public.empmaster_hdr` (corp DB via the `corp` service pool — reads `empmaster_id, emp_shortcode, emp_name, mobile_no, cognito_id, active_status`). Never written. Joined in Node by short code; not via SQL.
 - **Pool config:** `max: 5`, `idleTimeoutMillis: 30_000`, `connectionTimeoutMillis: 10_000`. One pool per `(env, service, instance)` cached for process lifetime.
 
 ## External Integrations
 
 - **AWS SQS** (direct, via `@aws-sdk/client-sqs`). `DeleteMessage` for clear actions and `ChangeMessageVisibility` (5s timeout) for refire actions. Credentials are taken from the env per-target (see "AWS Resources"). Replaces the previous Playground SQS HTTP API hop, which was IP-blocked from Vercel egress.
 - **Playground batch scheduler API** — `DELETE {scheduler_name}` with `Authorization: {"apiKey":"…"}` (note the JSON-encoded value). Removes the EventBridge Scheduler that would have re-fired the batch. Still HTTP-based; on error the returned `reason` includes a reproducible curl with the exact URL/headers/body.
+- **AWS Cognito** (direct, via `@aws-sdk/client-cognito-identity-provider`) — **read-only** `ListUsers` on the field-force user pool (`{ENV}_COGNITO_USERPOOL_ID`), filtered by `phone_number` or `sub`. Used only by the Auth Details Comparison tab. Credentials/region reuse the per-env `{ENV}_AWS_*` vars; those IAM creds need `cognito-idp:ListUsers`.
 
 ## Deployment
 
@@ -210,4 +237,4 @@ A third tab (`app/otp-block/page.tsx`, `lib/otp-block.ts`) that **clears the 24-
 - Acts directly on the V2 consumer SQS queues (`DeleteMessage` / `ChangeMessageVisibility`) — the same queues that `lambda-corp-consumer` and `lambda-oms-consumer` consume from.
 - Force-success or refire here is the **last-resort manual recovery path** when an event has failed beyond the consumer's automatic retry attempts.
 
-This service does **not** publish events and does not call any other Medvol backend — side effects are scoped to direct DB writes against the listed tables, direct AWS SQS calls against the V2 consumer queues, and HTTP calls to the Playground batch-scheduler API.
+This service does **not** publish events and does not call any other Medvol backend — side effects are scoped to direct DB writes against the listed tables, direct AWS SQS calls against the V2 consumer queues, and HTTP calls to the Playground batch-scheduler API. The Auth Details Comparison tab additionally performs **read-only** AWS Cognito `ListUsers` lookups, but never mutates Cognito.
