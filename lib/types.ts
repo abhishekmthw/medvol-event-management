@@ -109,6 +109,47 @@ export type BatchStatusRow = {
   modified_date: string | null;
 };
 
+/* ------------------------------------------------------------------ *
+ * Counter Events — read-only browser over public.events (Corp DB).
+ * ------------------------------------------------------------------ */
+
+export type CounterView = "division" | "products" | "stockist";
+
+/** A column in a counter results table — drives both the SQL alias and the UI header. */
+export type CounterColumn = {
+  /** Matches the SELECT alias / row key. */
+  key: string;
+  label: string;
+  /** Render as a localized date/time. */
+  isDate?: boolean;
+};
+
+/** Filters for a counter-events query. `streamIds` is mandatory; the rest are optional. */
+export type CounterFilters = {
+  streamIds: string[];
+  companyCode?: string | null;
+  /** company_divisioncode — applies to products + division views only. */
+  divisionCode?: string | null;
+  locationCode?: string | null;
+  /** ISO date (YYYY-MM-DD), inclusive lower bound on events.timestamp. */
+  fromDate?: string | null;
+  /** ISO date (YYYY-MM-DD), inclusive upper bound (matched as `< toDate + 1 day`). */
+  toDate?: string | null;
+};
+
+export type CounterQueryResult = {
+  ok: boolean;
+  columns: CounterColumn[];
+  rows: Record<string, unknown>[];
+  count: number;
+  /** True when the row cap was hit and results were trimmed. */
+  truncated: boolean;
+  message: string;
+};
+
+/** Option for the company / division cascading dropdowns (name shown, code submitted). */
+export type CounterOption = { code: string; name: string };
+
 export type OperationResult = {
   ok: boolean;
   message: string;

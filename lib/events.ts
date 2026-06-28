@@ -10,7 +10,7 @@ import type {
 
 const CONSUMER = "V2";
 
-function parseList(input: string): string[] {
+export function parseList(input: string): string[] {
   return input
     .split(/[\s,]+/)
     .map((s) => s.trim())

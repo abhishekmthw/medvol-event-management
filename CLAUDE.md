@@ -9,7 +9,7 @@
 
 **Type:** Internal Web App (Next.js 14, App Router)
 **Status:** Production
-**Entry point:** `app/page.tsx` (dashboard) — protected by `middleware.ts`; auth lives in `app/login/page.tsx`
+**Entry point:** `app/page.tsx` (Event Ops dashboard) — protected by `middleware.ts`; auth lives in `app/login/page.tsx`. A second tab `app/counter/page.tsx` (**Counter Events**) is reachable from the shared header nav.
 **Hosting:** GitHub repo `abhishekmthw/medvol-event-management`. No CI config in-tree (no `.github/`, no `Dockerfile`, no Pulumi). `.gitignore` lists `.vercel/`, suggesting Vercel deployment.
 
 ## Purpose
@@ -20,6 +20,8 @@ Mutations are performed by:
 - Direct `pg` writes to the database (set `event_status = 'Success'`, `forceStatus = true`).
 - Direct **AWS SQS SDK** calls (`DeleteMessage`, `ChangeMessageVisibility`) against the V2 consumer queues — one queue per `(service, environment)` for the shared accounts, plus per-(env) queues for each private instance (each private instance lives in its own AWS account).
 - Outbound calls to the external **Playground batch scheduler API** to delete EventBridge schedulers for batch retry rows.
+
+A second, **read-only** tab — **Counter Events** (`app/counter/page.tsx`) — browses the raw `public.events` event store in the **Corp DB** (stage/prod) to reconstruct historical counter master changes (division / products / stockist) per stream. It performs **no writes** (no SQS, no Playground); it only `SELECT`s from `public.events` (joined to Corp master tables for enrichment). See "Counter Events" below.
 
 ## Tech Stack
 
@@ -43,6 +45,11 @@ Mutations are performed by:
 | `app/api/auth/logout/route.ts` | `POST /api/auth/logout` — clears `em_session`. |
 | `app/api/instances/route.ts` | `GET /api/instances` — returns the list of `PRIVATE_INSTANCES` registered via env (Lupin today). The UI uses this to render the per-service instance picker. |
 | `app/api/events/run/route.ts` | `POST /api/events/run` — validates `{action, environment, service, instance, input, preview}`, dispatches to `lib/events.ts` action handlers, returns `OperationResult`. |
+| `app/counter/page.tsx` | **Counter Events** tab. View selector (division / products / stockist) + Environment (stage/prod, Corp-only), required Stream IDs textarea (+ Format IDs helper), cascading Company→Division dropdowns, Location free-text, From/To date pickers. Read-only — runs a query and renders `CounterTable`. |
+| `app/api/counter/companies/route.ts` | `GET ?environment=` — active companies from `company_hdr` (name shown, `code` submitted). |
+| `app/api/counter/divisions/route.ts` | `GET ?environment=&company=` — divisions from `companydivision_dtl` scoped to the company (cascaded dropdown). |
+| `app/api/counter/query/route.ts` | `POST {environment, view, streamIds, companyCode?, divisionCode?, locationCode?, fromDate?, toDate?}` — validates, parses stream IDs (`parseList`), forces Corp target, dispatches to `lib/counter.ts`, returns `CounterQueryResult`. |
+| `lib/counter.ts` | Counter Events queries (READ-ONLY, Corp-only). `COUNTER_COLUMNS` (per-view column defs), `queryCounterEvents` (per-view parameterized SQL builders with optional filters + `LIMIT 1000`), `fetchCompanies`, `fetchDivisions`. |
 | `lib/auth.ts` | `createSessionToken`, `verifySessionToken`, `verifyStaticCredentials` (timing-safe). Requires `AUTH_JWT_SECRET` ≥ 32 chars. |
 | `lib/db.ts` | `getPool(target)` — resolves env prefix `{SERVICE}_{ENV}` or `PRIVATE_INSTANCE_{ID}_{ENV}`, builds and caches a `pg.Pool`, validates required vars at first use. |
 | `lib/instances.ts` | Reads `PRIVATE_INSTANCES` (comma-sep ids) and per-instance `_LABEL` / `_SERVICE` env vars. |
@@ -50,7 +57,11 @@ Mutations are performed by:
 | `lib/sqs.ts` | Direct AWS SDK SQS client — `deleteSqsMessage` and `refireSqsMessage`. Resolves queue URL + region + credentials per target: shared uses per-env vars (`{ENV}_AWS_*`, `{SERVICE}_{ENV}_SQS_QUEUE_URL`); each private instance uses per-instance creds (`PRIVATE_INSTANCE_{ID}_AWS_*`, shared across stage and prod since the instance lives in one AWS account) with per-env queue URLs (`PRIVATE_INSTANCE_{ID}_{ENV}_SQS_QUEUE_URL`). Maps known "receipt invalid" errors (`ReceiptHandleIsInvalid`, `InvalidParameterValue`, `MessageNotInflight`, `InvalidIdFormat`) to a `gone` outcome; other AWS errors surface with `queueUrl`, `region`, `httpStatus`, `requestId` in the reason. |
 | `lib/playground.ts` | HTTPS client for the Playground batch scheduler API only (`DELETE {scheduler_name}` with `Authorization: {"apiKey":"…"}`). Honors `PLAYGROUND_FETCH_TIMEOUT_MS` (default 10s) with `AbortController`. Returns the request as a reproducible curl on error. The SQS half of this file was migrated to direct AWS SDK calls — see `lib/sqs.ts`. |
 | `lib/rate-limit.ts` | IP-bucket failure counter + lockout state. Keys by `x-forwarded-for[0]` → `x-real-ip` → `"unknown"`. |
-| `lib/types.ts` | Action keys + `ACTIONS` metadata (labels, placeholders, hints, `danger` flag), row types (`EventStatusRow`, `BatchStatusRow`), `OperationResult`, `Target`. |
+| `lib/types.ts` | Action keys + `ACTIONS` metadata (labels, placeholders, hints, `danger` flag), row types (`EventStatusRow`, `BatchStatusRow`), `OperationResult`, `Target`, and Counter Events types (`CounterView`, `CounterColumn`, `CounterFilters`, `CounterQueryResult`, `CounterOption`). |
+| `components/app-header.tsx` | Shared sticky header with the section nav tabs (`Event Ops` → `/`, `Counter Events` → `/counter`), theme toggle and logout. Used by both pages. |
+| `components/segmented.tsx` | Shared `Segmented<T>` tab-style single-select control (lifted out of `page.tsx`). |
+| `components/format-ids-modal.tsx` | Shared `FormatIdsModal` paste-to-CSV helper (lifted out of `page.tsx`). |
+| `components/counter-table.tsx` | Generic, column-driven results table for Counter Events (columns vary per view, unlike the fixed `EventTable`/`BatchTable`). |
 | `components/logo.tsx` | MedVol logo SVG component. |
 | `components/theme-provider.tsx` | `next-themes` wrapper. |
 | `components/theme-toggle.tsx` | Light/dark toggle button. |
@@ -82,6 +93,19 @@ The UI's instance picker is rendered dynamically from `/api/instances` (which re
 **Input parsing.** `parseList()` splits on **whitespace OR commas** and trims/filters empties — so users can paste comma-separated, space-separated, or newline-separated IDs. `partitionIdentifiers()` treats purely-digit tokens as event IDs (cast to `numeric[]` for `event_consumer_status.eventid`) and everything else as stream IDs (cast to `text[]` for `streamid`). All DB calls use parameterized queries — no string interpolation.
 
 **Format IDs helper (UI).** The dashboard exposes a `Wand2` button next to the input area that opens a modal for assembling comma-separated strings from a multi-line paste. Options: strip arbitrary characters (e.g. `"`), prefix and/or suffix each item (e.g. wrap with `'…'` for raw SQL elsewhere). Output has a clipboard copy button. Purely client-side; does not touch the API.
+
+## Counter Events (read-only)
+
+A second tab (`app/counter/page.tsx`, `lib/counter.ts`) for **auditing historical counter master changes** straight from the `public.events` event store in the **Corp DB** (stage/prod). It does **no writes** — no SQS, no Playground, no preview/confirm flow.
+
+- **Three views**, each filtering `events.event_type LIKE '%COUNTER_{DIVISION|PRODUCT|STOCKIST}%'` (the view drives the pattern — it is not a user input):
+  - **Counter Products** — unnests `data->'counter_product_slab'`, enriched with division (`company_divisioncode`, `division_name`) via `companyproduct_hdr → item_divisiondtl → companydivision_dtl`. The join chain runs **once per event inside a CTE**, then the slab unnest runs last (avoids recomputing the joins per slab — the inefficiency of the original ad-hoc query).
+  - **Counter Division** — unnests `data->'company_division_code'` (division name + code live in each array element under `company_division_name` / `company_division_code`); employee name via `emp_position_hdr → empmaster_hdr`.
+  - **Counter Stockist** — joins `StockistCluster_Lnk → StockistCompany_Lnk` and `cluster_hdr`. The `::integer` casts on jsonb values are **regex-guarded** (`~ '^[0-9]+$'`) so one bad value can't abort the query. No division concept.
+- **Filters:** Stream ID(s) **mandatory** (`= ANY($1::text[])`, `parseList`); Company (`data->>'company_code'`, all views), Division (products via `idd.company_divisioncode`, division via the array element's `company_division_code`; **hidden for stockist**), Location (`data->>'location_code'`), and From/To date (`timestamp >= from::date` / `< to::date + 1 day`) — all optional.
+- **Dropdowns:** Company list from `company_hdr` (active only, name shown / `code` submitted); Division cascades from `companydivision_dtl WHERE company_code = …`. Codes are compared as text against the jsonb values.
+- **Safeguards:** every query is parameterized (no interpolation) and capped at `LIMIT 1000` (`truncated` flag surfaces a "showing first 1000" badge). The mandatory, most-selective predicate is the stream id — performance assumes an index on `events."eventStreamStreamId"` (verify on prod; the same table already caused a documented seq-scan 504 for the `event_type` lookup in `lib/events.ts`).
+- **Caveat:** an item mapped to multiple divisions multiplies product rows (one per slab × division).
 
 ## Environment Variables
 
@@ -131,8 +155,9 @@ The UI's instance picker is rendered dynamically from `/api/instances` (which re
 - **Engine:** PostgreSQL (port 5432).
 - **Tables read/written:**
   - `public.event_consumer_status` — V2 consumer tracking. Reads `id, eventid, streamid, consumer_name, event_status, "forceStatus", receipthandle, approximatereceivecount, sentry_issue_id, sentry_issue_status, error_message, modified_date`. Updates `event_status = 'Success'`, `"forceStatus" = true` on clear actions. All queries filter `consumer_name = 'V2'`.
-  - `public.events` — joined left for `event_type` only (lookup via `events."eventId" = event_consumer_status.eventid`). Never written.
+  - `public.events` — **(Event Ops)** joined left for `event_type` only (lookup via `events."eventId" = event_consumer_status.eventid`). **(Counter Events)** read in full per stream: `data` (jsonb), `event_type`, `timestamp`, `"eventId"`, `"eventStreamStreamId"` — never written.
   - `public.batch_event_status` — V2 batch tracking. Reads `id, batch_id, batch_sequence, event_type, event_status, force_status, data, modified_date`. Updates `event_status = 'Success'`, `"force_status" = true` on `clear-batch`.
+  - **Counter Events read-only joins (Corp DB):** `company_hdr`, `companydivision_dtl` (dropdowns); `companyproduct_hdr`, `item_divisiondtl`, `companydivision_dtl` (products enrichment); `emp_position_hdr`, `empmaster_hdr` (division employee); `StockistCluster_Lnk`, `StockistCompany_Lnk`, `cluster_hdr` (stockist). Never written.
 - **Pool config:** `max: 5`, `idleTimeoutMillis: 30_000`, `connectionTimeoutMillis: 10_000`. One pool per `(env, service, instance)` cached for process lifetime.
 
 ## External Integrations
