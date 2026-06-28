@@ -13,6 +13,7 @@ import type {
 
 const HEADERS = [
   "Short Code",
+  "Company Code",
   "Present in Auth",
   "Present in Corp",
   "Name (Auth)",
@@ -62,7 +63,8 @@ function rowCells(r: AuthComparisonRow): string[] {
     ? c.skippedReason ?? "Not checked"
     : c.error ?? "";
   return [
-    r.key,
+    r.shortCode,
+    r.companyCode,
     yn(r.flags.presentInAuth),
     yn(r.flags.presentInCorp),
     r.auth?.name ?? "",

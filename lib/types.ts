@@ -237,6 +237,7 @@ export const EMPLOYEE_SCOPES: { value: EmployeeScope; label: string }[] = [
 export type AuthEmployeeRow = {
   id: string;
   short_code: string | null;
+  company_code: string | null;
   name: string | null;
   mobile_no: string | null;
   cognito_id: string | null;
@@ -247,6 +248,7 @@ export type AuthEmployeeRow = {
 export type CorpEmployeeRow = {
   empmaster_id: string;
   emp_shortcode: string | null;
+  company_code: string | null;
   emp_name: string | null;
   mobile_no: string | null;
   cognito_id: string | null;
@@ -293,8 +295,12 @@ export type AuthComparisonFlags = {
 
 /** One reconciled employee across the three sources. */
 export type AuthComparisonRow = {
-  /** Match key (employee short code). */
+  /** Composite match key (`<short code>\0<company code>`) — React key / dedup only. */
   key: string;
+  /** Employee short code (the identity, shared by a matched pair). */
+  shortCode: string;
+  /** Company code (part of the identity, shared by a matched pair). */
+  companyCode: string;
   auth: AuthEmployeeRow | null;
   corp: CorpEmployeeRow | null;
   cognito: CognitoLookup;

@@ -17,10 +17,18 @@ import type {
  *   - AWS Cognito                   (lib/cognito.ts, ListUsers only)
  *
  * The two DBs are reached through separately-configured pools that may point at
- * different databases, so they are fetched independently and joined in Node by
- * employee short code — never via a cross-DB SQL join. Both DBs use 'Y' for
- * active in their `active_status` column. No source is ever written to.
+ * different databases, so they are fetched independently and joined in Node by the
+ * (short code, company code) pair — never via a cross-DB SQL join. A short code is
+ * only unique within a company (the same code is reused across companies), so the
+ * company code is part of the match key. Both `company_code` columns hold the same
+ * human company code (auth `Companies.id` is a PrimaryColumn = the code; the FK
+ * stores it directly; corp `empmaster_hdr.company_code` matches `company_hdr.code`).
+ * Both DBs use 'Y' for active. No source is ever written to.
  */
+
+/** NUL separator for the composite (short code, company code) map key — a NUL
+ * can't appear in a short/company code, so distinct pairs never collide. */
+const KEY_SEP = String.fromCharCode(0);
 
 const BULK_LIMIT = 100;
 /** Cap on concurrent Cognito calls so a 100-record scan doesn't get throttled. */
@@ -64,13 +72,14 @@ async function fetchAuthEmployees(
     SELECT
       id::text AS id,
       short_code,
+      company_code::text AS company_code,
       name,
       mobile_no,
       cognito_id,
       active_status
     FROM "${schema}"."Field_Force_Users"
     WHERE ${where.join(" AND ")}
-    ORDER BY short_code NULLS LAST, id`;
+    ORDER BY short_code NULLS LAST, company_code NULLS LAST, id`;
   const { rows } = await pool.query(sql, params);
   return rows as AuthEmployeeRow[];
 }
@@ -93,59 +102,79 @@ async function fetchCorpEmployees(
     SELECT
       empmaster_id::text AS empmaster_id,
       emp_shortcode,
+      company_code::text AS company_code,
       emp_name,
       mobile_no::text AS mobile_no,
       cognito_id,
       active_status
     FROM public.empmaster_hdr
     WHERE ${where.join(" AND ")}
-    ORDER BY emp_shortcode NULLS LAST, empmaster_id`;
+    ORDER BY emp_shortcode NULLS LAST, company_code NULLS LAST, empmaster_id`;
   const { rows } = await pool.query(sql, params);
   return rows as CorpEmployeeRow[];
 }
 
 /* --------------------------- pairing/diff --------------------------- */
 
-type Pair = { auth: AuthEmployeeRow | null; corp: CorpEmployeeRow | null; key: string };
+type Pair = {
+  auth: AuthEmployeeRow | null;
+  corp: CorpEmployeeRow | null;
+  key: string;
+  shortCode: string;
+  companyCode: string;
+};
+
+/** Composite identity key — a short code is only unique within a company. */
+function pairKey(shortCode: string, companyCode: string): string {
+  return `${norm(shortCode)}${KEY_SEP}${norm(companyCode)}`;
+}
 
 /**
- * Join auth and corp rows by short code. Rows that share a code are zipped
- * together (index-aligned) so duplicates don't get lost; a code present on only
- * one side yields an unpaired row (the "missing in auth/corp" case). Keys are
- * sorted for deterministic "first 100" selection.
+ * Join auth and corp rows by the (short code, company code) pair. Rows that share
+ * a pair are zipped together (index-aligned) so duplicates don't get lost; a pair
+ * present on only one side yields an unpaired row (the "missing in auth/corp"
+ * case). Keys are sorted for deterministic "first 100" selection.
  */
-function pairByShortCode(
+function pairByShortCodeAndCompany(
   authRows: AuthEmployeeRow[],
   corpRows: CorpEmployeeRow[],
 ): Pair[] {
-  const authByCode = new Map<string, AuthEmployeeRow[]>();
-  const corpByCode = new Map<string, CorpEmployeeRow[]>();
+  const authByKey = new Map<string, AuthEmployeeRow[]>();
+  const corpByKey = new Map<string, CorpEmployeeRow[]>();
   for (const r of authRows) {
-    const k = norm(r.short_code);
-    (authByCode.get(k) ?? authByCode.set(k, []).get(k)!).push(r);
+    const k = pairKey(r.short_code ?? "", r.company_code ?? "");
+    (authByKey.get(k) ?? authByKey.set(k, []).get(k)!).push(r);
   }
   for (const r of corpRows) {
-    const k = norm(r.emp_shortcode);
-    (corpByCode.get(k) ?? corpByCode.set(k, []).get(k)!).push(r);
+    const k = pairKey(r.emp_shortcode ?? "", r.company_code ?? "");
+    (corpByKey.get(k) ?? corpByKey.set(k, []).get(k)!).push(r);
   }
   const keys = Array.from(
-    new Set<string>([...authByCode.keys(), ...corpByCode.keys()]),
+    new Set<string>([...authByKey.keys(), ...corpByKey.keys()]),
   ).sort();
 
   const pairs: Pair[] = [];
   for (const k of keys) {
-    const a = authByCode.get(k) ?? [];
-    const c = corpByCode.get(k) ?? [];
+    const a = authByKey.get(k) ?? [];
+    const c = corpByKey.get(k) ?? [];
     const n = Math.max(a.length, c.length);
     for (let i = 0; i < n; i++) {
-      pairs.push({ auth: a[i] ?? null, corp: c[i] ?? null, key: k });
+      const auth = a[i] ?? null;
+      const corp = c[i] ?? null;
+      pairs.push({
+        auth,
+        corp,
+        key: k,
+        shortCode: norm(auth?.short_code ?? corp?.emp_shortcode),
+        companyCode: norm(auth?.company_code ?? corp?.company_code),
+      });
     }
   }
   return pairs;
 }
 
 function buildComparison(pair: Pair): AuthComparisonRow {
-  const { auth, corp, key } = pair;
+  const { auth, corp, key, shortCode, companyCode } = pair;
   const presentInAuth = auth !== null;
   const presentInCorp = corp !== null;
   const bothPresent = presentInAuth && presentInCorp;
@@ -174,6 +203,8 @@ function buildComparison(pair: Pair): AuthComparisonRow {
 
   return {
     key,
+    shortCode,
+    companyCode,
     auth,
     corp,
     cognito: { checked: false, byMobile: [], bySub: [] },
@@ -311,7 +342,7 @@ export async function compareByMobile(
     fetchCorpEmployees(environment, scope, mobile10),
   ]);
 
-  const rows = pairByShortCode(authRows, corpRows).map(buildComparison);
+  const rows = pairByShortCodeAndCompany(authRows, corpRows).map(buildComparison);
   await enrichWithCognito(environment, rows);
   dedupeStatuses(rows);
 
@@ -340,7 +371,7 @@ export async function scanInconsistent(
     fetchCorpEmployees(environment, scope),
   ]);
 
-  const all = pairByShortCode(authRows, corpRows).map(buildComparison);
+  const all = pairByShortCodeAndCompany(authRows, corpRows).map(buildComparison);
   const inconsistentAll = all.filter((r) => r.inconsistent);
   const total = inconsistentAll.length;
   const slice = inconsistentAll.slice(0, limit);

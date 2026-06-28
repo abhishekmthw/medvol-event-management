@@ -36,6 +36,7 @@ export function AuthComparisonTable({ rows }: { rows: AuthComparisonRow[] }) {
         <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
           <tr>
             <Th>Short code</Th>
+            <Th>Company</Th>
             <Th>Name</Th>
             <Th>Mobile</Th>
             <Th>Cognito ID</Th>
@@ -52,7 +53,8 @@ export function AuthComparisonTable({ rows }: { rows: AuthComparisonRow[] }) {
               key={`${r.key}-${i}`}
               className="border-t border-[hsl(var(--border))] align-top hover:bg-[hsl(var(--muted))]/40"
             >
-              <Td className="font-mono whitespace-nowrap">{r.key || "—"}</Td>
+              <Td className="font-mono whitespace-nowrap">{r.shortCode || "—"}</Td>
+              <Td className="font-mono whitespace-nowrap">{r.companyCode || "—"}</Td>
 
               {/* Name: auth / corp / cognito (by mobile) */}
               <Td>
