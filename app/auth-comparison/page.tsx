@@ -168,10 +168,11 @@ export default function AuthComparisonPage() {
           </div>
 
           <p className="text-xs text-[hsl(var(--muted-foreground))]">
-            Reconciles field-force employees across the auth DB
-            (<code>Field_Force_Users</code>), the corp DB (<code>empmaster_hdr</code>)
-            and AWS Cognito, comparing <b>name</b>, <b>short code</b>,{" "}
-            <b>mobile number</b> and <b>cognito id</b>.
+            Takes corp (<code>empmaster_hdr</code>) as the source of truth and
+            checks each employee against the auth DB
+            (<code>Field_Force_Users</code>, matched by short code + company code)
+            and AWS Cognito — comparing <b>name</b>, <b>mobile number</b> and{" "}
+            <b>cognito id</b> (Cognito is the source of truth for cognito id).
           </p>
 
           <div className="space-y-2">
@@ -197,12 +198,14 @@ export default function AuthComparisonPage() {
               <Info className="h-3 w-3 mt-0.5 shrink-0" />
               {bulkMode ? (
                 <>
-                  Empty → bulk scan: the first <b>100</b> employees whose auth and
-                  corp records differ, then Cognito is checked for those.
+                  Empty → bulk scan: the first <b>100</b> corp employees that
+                  don&apos;t match auth (missing, or name / mobile / cognito_id
+                  differs), each validated against Cognito.
                 </>
               ) : (
                 <>
-                  A single employee is fetched from all three sources and compared.
+                  The corp employee(s) with this mobile are fetched, then checked
+                  against auth and Cognito.
                 </>
               )}
             </p>

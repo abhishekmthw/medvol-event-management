@@ -279,35 +279,43 @@ export type CognitoLookup = {
   error?: string;
 };
 
-/** Per-field disagreement flags between auth and corp. */
+/**
+ * Disagreement flags for one corp employee (corp is the base + source of truth
+ * for name/short code/company code/mobile; Cognito is the source of truth for
+ * cognito_id). All comparisons are "X deviates from the source of truth".
+ */
 export type AuthComparisonFlags = {
+  /** A matching auth record was found for this corp (short_code, company_code). */
   presentInAuth: boolean;
-  presentInCorp: boolean;
-  /** Both present and `name` differs (case-insensitive). */
+  /** auth.name differs from corp.emp_name (corp = truth). */
   nameMismatch: boolean;
-  /** Both present and normalized mobile differs. */
+  /** auth.mobile_no differs from corp.mobile_no (corp = truth). */
   mobileMismatch: boolean;
-  /** Both present and `cognito_id` differs (incl. one null / one set). */
-  cognitoIdMismatch: boolean;
-  /** cognito_id is null/empty in BOTH DBs — the expected-consistent state. */
-  bothCognitoNull: boolean;
+  /** auth.cognito_id differs from corp.cognito_id (cheap DB-vs-DB proxy). */
+  authCorpCognitoMismatch: boolean;
+  /** corp.cognito_id differs from the live Cognito sub (set after enrichment). */
+  corpCognitoMismatch: boolean;
+  /** auth.cognito_id differs from the live Cognito sub (set after enrichment). */
+  authCognitoMismatch: boolean;
 };
 
-/** One reconciled employee across the three sources. */
+/** One corp employee reconciled against auth and Cognito. */
 export type AuthComparisonRow = {
-  /** Composite match key (`<short code>\0<company code>`) — React key / dedup only. */
+  /** Unique row key (corp empmaster_id) — React key / dedup only. */
   key: string;
-  /** Employee short code (the identity, shared by a matched pair). */
+  /** Employee short code (corp = source of truth). */
   shortCode: string;
-  /** Company code (part of the identity, shared by a matched pair). */
+  /** Company code (corp = source of truth). */
   companyCode: string;
-  auth: AuthEmployeeRow | null;
+  /** The corp employee — always present (corp is the base set). */
   corp: CorpEmployeeRow | null;
+  /** The matching auth record, or null when missing in auth. */
+  auth: AuthEmployeeRow | null;
   cognito: CognitoLookup;
   flags: AuthComparisonFlags;
-  /** True if presence differs or any compared field disagrees (auth vs corp). */
+  /** True if missing in auth or any field deviates from its source of truth. */
   inconsistent: boolean;
-  /** Human-readable status chips (e.g. "Missing in auth", "cognito_id mismatch"). */
+  /** Human-readable status chips (e.g. "Missing in auth", "corp cognito_id ≠ Cognito"). */
   statuses: string[];
 };
 

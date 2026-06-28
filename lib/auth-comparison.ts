@@ -11,19 +11,23 @@ import type {
 } from "./types";
 
 /**
- * Read-only reconciliation of field-force employees across three sources:
- *   - auth DB  `Field_Force_Users`  (getAuthPool + authSchema)
- *   - corp DB  `empmaster_hdr`      (getPool, corp service)
- *   - AWS Cognito                   (lib/cognito.ts, ListUsers only)
+ * Read-only reconciliation of field-force employees, driven by CORP:
  *
- * The two DBs are reached through separately-configured pools that may point at
- * different databases, so they are fetched independently and joined in Node by the
- * (short code, company code) pair — never via a cross-DB SQL join. A short code is
- * only unique within a company (the same code is reused across companies), so the
- * company code is part of the match key. Both `company_code` columns hold the same
- * human company code (auth `Companies.id` is a PrimaryColumn = the code; the FK
- * stores it directly; corp `empmaster_hdr.company_code` matches `company_hdr.code`).
- * Both DBs use 'Y' for active. No source is ever written to.
+ *   1. Fetch the list of employees from corp `empmaster_hdr` (the base set, and
+ *      the source of truth for short code, company code, name and mobile).
+ *   2. For each, look up the matching record in auth `Field_Force_Users` by the
+ *      (short code, company code) pair — a short code is only unique within a
+ *      company. Auth records with no corp match are NOT reported.
+ *   3. Validate cognito_id against AWS Cognito — the source of truth for
+ *      cognito_id — by looking the user up by the corp mobile (and by the stored
+ *      subs), then flagging corp/auth cognito_id values that disagree with it.
+ *
+ * The corp and auth DBs are reached through separately-configured pools that may
+ * point at different databases, so they are fetched independently and joined in
+ * Node — never via a cross-DB SQL join. Both `company_code` columns hold the same
+ * human company code (auth `Companies.id` PrimaryColumn = the code, stored on the
+ * FK; corp `empmaster_hdr.company_code` = `company_hdr.code`). Corp uses 'Y' for
+ * active. No source is ever written to.
  */
 
 /** NUL separator for the composite (short code, company code) map key — a NUL
@@ -50,40 +54,14 @@ function norm(v: string | null | undefined): string {
   return (v ?? "").trim();
 }
 
-/* ----------------------------- DB fetch ----------------------------- */
-
-async function fetchAuthEmployees(
-  environment: Environment,
-  scope: EmployeeScope,
-  mobile10?: string,
-): Promise<AuthEmployeeRow[]> {
-  const pool = getAuthPool(environment);
-  const schema = authSchema(environment);
-  const where: string[] = ["1=1"];
-  const params: string[] = [];
-  if (scope === "active") where.push("active_status = 'Y'");
-  if (mobile10) {
-    params.push(mobile10);
-    where.push(`mobile_no = $${params.length}`);
-  }
-  // Schema is a validated identifier; the table name is a fixed constant; the
-  // mobile is parameterized.
-  const sql = `
-    SELECT
-      id::text AS id,
-      short_code,
-      company_code::text AS company_code,
-      name,
-      mobile_no,
-      cognito_id,
-      active_status
-    FROM "${schema}"."Field_Force_Users"
-    WHERE ${where.join(" AND ")}
-    ORDER BY short_code NULLS LAST, company_code NULLS LAST, id`;
-  const { rows } = await pool.query(sql, params);
-  return rows as AuthEmployeeRow[];
+/** Composite identity key — a short code is only unique within a company. */
+function pairKey(shortCode: string | null, companyCode: string | null): string {
+  return `${norm(shortCode)}${KEY_SEP}${norm(companyCode)}`;
 }
 
+/* ----------------------------- DB fetch ----------------------------- */
+
+/** Corp employees (the base). Scope filters this set; `mobile10` narrows it. */
 async function fetchCorpEmployees(
   environment: Environment,
   scope: EmployeeScope,
@@ -91,7 +69,7 @@ async function fetchCorpEmployees(
 ): Promise<CorpEmployeeRow[]> {
   const pool = getPool({ environment, service: "corp", instance: null });
   const where: string[] = ["1=1"];
-  const params: string[] = [];
+  const params: unknown[] = [];
   if (scope === "active") where.push("active_status = 'Y'");
   if (mobile10) {
     params.push(mobile10);
@@ -114,107 +92,108 @@ async function fetchCorpEmployees(
   return rows as CorpEmployeeRow[];
 }
 
+/**
+ * Auth records, used only to look up the corp employees. Never filtered by active
+ * status (we want to detect a corp employee that exists in auth even if inactive
+ * there). `shortCodes`, when given, restricts the fetch to those short codes
+ * (used by single-mobile lookup to avoid scanning the whole table).
+ */
+async function fetchAuthEmployees(
+  environment: Environment,
+  shortCodes?: string[],
+): Promise<AuthEmployeeRow[]> {
+  const pool = getAuthPool(environment);
+  const schema = authSchema(environment);
+  const where: string[] = ["1=1"];
+  const params: unknown[] = [];
+  if (shortCodes && shortCodes.length) {
+    params.push(shortCodes);
+    where.push(`short_code = ANY($${params.length}::text[])`);
+  }
+  // Schema is a validated identifier; the table name is a fixed constant; values
+  // are parameterized.
+  const sql = `
+    SELECT
+      id::text AS id,
+      short_code,
+      company_code::text AS company_code,
+      name,
+      mobile_no,
+      cognito_id,
+      active_status
+    FROM "${schema}"."Field_Force_Users"
+    WHERE ${where.join(" AND ")}
+    ORDER BY short_code NULLS LAST, company_code NULLS LAST, id`;
+  const { rows } = await pool.query(sql, params);
+  return rows as AuthEmployeeRow[];
+}
+
 /* --------------------------- pairing/diff --------------------------- */
 
 type Pair = {
+  corp: CorpEmployeeRow;
   auth: AuthEmployeeRow | null;
-  corp: CorpEmployeeRow | null;
-  key: string;
-  shortCode: string;
-  companyCode: string;
+  authMatchCount: number;
 };
 
-/** Composite identity key — a short code is only unique within a company. */
-function pairKey(shortCode: string, companyCode: string): string {
-  return `${norm(shortCode)}${KEY_SEP}${norm(companyCode)}`;
-}
-
 /**
- * Join auth and corp rows by the (short code, company code) pair. Rows that share
- * a pair are zipped together (index-aligned) so duplicates don't get lost; a pair
- * present on only one side yields an unpaired row (the "missing in auth/corp"
- * case). Keys are sorted for deterministic "first 100" selection.
+ * Corp-driven join: one entry per corp employee, matched to its auth record by
+ * the (short code, company code) pair. Corp order (from the SQL) is preserved for
+ * deterministic "first 100" selection. Auth rows with no corp match are dropped.
  */
-function pairByShortCodeAndCompany(
-  authRows: AuthEmployeeRow[],
+function pairFromCorp(
   corpRows: CorpEmployeeRow[],
+  authRows: AuthEmployeeRow[],
 ): Pair[] {
   const authByKey = new Map<string, AuthEmployeeRow[]>();
-  const corpByKey = new Map<string, CorpEmployeeRow[]>();
   for (const r of authRows) {
-    const k = pairKey(r.short_code ?? "", r.company_code ?? "");
+    const k = pairKey(r.short_code, r.company_code);
     (authByKey.get(k) ?? authByKey.set(k, []).get(k)!).push(r);
   }
-  for (const r of corpRows) {
-    const k = pairKey(r.emp_shortcode ?? "", r.company_code ?? "");
-    (corpByKey.get(k) ?? corpByKey.set(k, []).get(k)!).push(r);
-  }
-  const keys = Array.from(
-    new Set<string>([...authByKey.keys(), ...corpByKey.keys()]),
-  ).sort();
-
-  const pairs: Pair[] = [];
-  for (const k of keys) {
-    const a = authByKey.get(k) ?? [];
-    const c = corpByKey.get(k) ?? [];
-    const n = Math.max(a.length, c.length);
-    for (let i = 0; i < n; i++) {
-      const auth = a[i] ?? null;
-      const corp = c[i] ?? null;
-      pairs.push({
-        auth,
-        corp,
-        key: k,
-        shortCode: norm(auth?.short_code ?? corp?.emp_shortcode),
-        companyCode: norm(auth?.company_code ?? corp?.company_code),
-      });
-    }
-  }
-  return pairs;
+  return corpRows.map((corp) => {
+    const matches = authByKey.get(pairKey(corp.emp_shortcode, corp.company_code)) ?? [];
+    return { corp, auth: matches[0] ?? null, authMatchCount: matches.length };
+  });
 }
 
 function buildComparison(pair: Pair): AuthComparisonRow {
-  const { auth, corp, key, shortCode, companyCode } = pair;
+  const { corp, auth, authMatchCount } = pair;
   const presentInAuth = auth !== null;
-  const presentInCorp = corp !== null;
-  const bothPresent = presentInAuth && presentInCorp;
 
   const nameMismatch =
-    bothPresent &&
-    norm(auth!.name).toLowerCase() !== norm(corp!.emp_name).toLowerCase();
+    presentInAuth &&
+    norm(auth!.name).toLowerCase() !== norm(corp.emp_name).toLowerCase();
   const mobileMismatch =
-    bothPresent &&
-    normalizeMobile(auth!.mobile_no) !== normalizeMobile(corp!.mobile_no);
-
-  const authCog = norm(auth?.cognito_id);
-  const corpCog = norm(corp?.cognito_id);
-  const cognitoIdMismatch = bothPresent && authCog !== corpCog;
-  const bothCognitoNull = !authCog && !corpCog;
+    presentInAuth &&
+    normalizeMobile(auth!.mobile_no) !== normalizeMobile(corp.mobile_no);
+  const authCorpCognitoMismatch =
+    presentInAuth && norm(auth!.cognito_id) !== norm(corp.cognito_id);
 
   const statuses: string[] = [];
   if (!presentInAuth) statuses.push("Missing in auth");
-  if (!presentInCorp) statuses.push("Missing in corp");
-  if (nameMismatch) statuses.push("Name mismatch");
-  if (mobileMismatch) statuses.push("Mobile mismatch");
-  if (cognitoIdMismatch) statuses.push("cognito_id mismatch (auth vs corp)");
+  if (nameMismatch) statuses.push("Name differs from corp");
+  if (mobileMismatch) statuses.push("Mobile differs from corp");
+  if (authCorpCognitoMismatch) statuses.push("auth cognito_id ≠ corp cognito_id");
+  if (authMatchCount > 1) statuses.push("Multiple auth matches");
 
+  // Cheap (pre-Cognito) inconsistency — drives the bulk top-100 selection.
   const inconsistent =
-    !bothPresent || nameMismatch || mobileMismatch || cognitoIdMismatch;
+    !presentInAuth || nameMismatch || mobileMismatch || authCorpCognitoMismatch;
 
   return {
-    key,
-    shortCode,
-    companyCode,
-    auth,
+    key: corp.empmaster_id,
+    shortCode: norm(corp.emp_shortcode),
+    companyCode: norm(corp.company_code),
     corp,
+    auth,
     cognito: { checked: false, byMobile: [], bySub: [] },
     flags: {
       presentInAuth,
-      presentInCorp,
       nameMismatch,
       mobileMismatch,
-      cognitoIdMismatch,
-      bothCognitoNull,
+      authCorpCognitoMismatch,
+      corpCognitoMismatch: false,
+      authCognitoMismatch: false,
     },
     inconsistent,
     statuses,
@@ -223,82 +202,78 @@ function buildComparison(pair: Pair): AuthComparisonRow {
 
 /* --------------------------- Cognito step --------------------------- */
 
-/** Add cognito-vs-DB cross-check notes once the lookup has run. */
-function finalizeCognitoStatuses(row: AuthComparisonRow): void {
+/**
+ * Validate cognito_id against the live Cognito user (the source of truth),
+ * looked up by the corp mobile. Sets the corp/auth cognito-mismatch flags and
+ * status notes, and may flip the record to inconsistent.
+ */
+function applyCognitoTruth(row: AuthComparisonRow): void {
   const c = row.cognito;
   if (!c.checked) return;
   if (c.error) {
     row.statuses.push("Cognito lookup error");
+    row.inconsistent = true;
     return;
   }
-  const authCog = norm(row.auth?.cognito_id);
-  const corpCog = norm(row.corp?.cognito_id);
-  const mobileSubs = c.byMobile.map((u) => norm(u.sub)).filter(Boolean);
 
-  if ((authCog || corpCog) && c.byMobile.length === 0) {
-    row.statuses.push("No Cognito user for mobile");
-  }
-  if (mobileSubs.length) {
-    if (authCog && !mobileSubs.includes(authCog)) {
-      row.statuses.push("auth cognito_id ≠ Cognito (by mobile)");
+  const realSubs = c.byMobile.map((u) => norm(u.sub)).filter(Boolean);
+  const hasCognitoUser = realSubs.length > 0;
+  const corpCog = norm(row.corp?.cognito_id);
+  const authCog = norm(row.auth?.cognito_id);
+
+  const mismatchVsTruth = (stored: string): boolean =>
+    hasCognitoUser ? !realSubs.includes(stored) : Boolean(stored);
+
+  const corpCognitoMismatch = mismatchVsTruth(corpCog);
+  const authCognitoMismatch = row.flags.presentInAuth
+    ? mismatchVsTruth(authCog)
+    : false;
+
+  row.flags.corpCognitoMismatch = corpCognitoMismatch;
+  row.flags.authCognitoMismatch = authCognitoMismatch;
+
+  if (!hasCognitoUser) {
+    if (corpCog || authCog) row.statuses.push("No Cognito user for corp mobile");
+  } else {
+    if (corpCognitoMismatch) {
+      row.statuses.push(corpCog ? "corp cognito_id ≠ Cognito" : "corp cognito_id missing (Cognito has it)");
     }
-    if (corpCog && !mobileSubs.includes(corpCog)) {
-      row.statuses.push("corp cognito_id ≠ Cognito (by mobile)");
+    if (row.flags.presentInAuth && authCognitoMismatch) {
+      row.statuses.push(authCog ? "auth cognito_id ≠ Cognito" : "auth cognito_id missing (Cognito has it)");
     }
   }
-  const rowMobile =
-    normalizeMobile(row.auth?.mobile_no) ?? normalizeMobile(row.corp?.mobile_no);
   for (const s of c.bySub) {
-    if (s.users.length === 0) {
-      row.statuses.push("cognito_id not found in Cognito");
-    } else {
-      const subMobile = normalizeMobile(s.users[0].phone_number);
-      if (rowMobile && subMobile && rowMobile !== subMobile) {
-        row.statuses.push("Cognito phone ≠ DB mobile (by sub)");
-      }
-    }
+    if (s.users.length === 0) row.statuses.push("Stored cognito_id not found in Cognito");
   }
+
+  if (corpCognitoMismatch || authCognitoMismatch) row.inconsistent = true;
 }
 
 /**
- * Enrich each record that has at least one stored cognito_id (per the rule:
- * both-null → consistent → skip Cognito). Runs in bounded-concurrency batches;
- * a per-record failure is captured on the record, never thrown.
+ * Always validate every shown record against Cognito (Cognito is the source of
+ * truth for cognito_id): look the user up by the corp mobile and by each stored
+ * sub, in bounded-concurrency batches. A per-record failure is captured on the
+ * record, never thrown.
  */
 async function enrichWithCognito(
   environment: Environment,
   rows: AuthComparisonRow[],
 ): Promise<void> {
-  const targets = rows.filter((r) => {
-    if (r.flags.bothCognitoNull) {
-      r.cognito = {
-        checked: false,
-        skippedReason: "cognito_id null in both auth and corp",
-        byMobile: [],
-        bySub: [],
-      };
-      return false;
-    }
-    return true;
-  });
-
-  for (let i = 0; i < targets.length; i += COGNITO_CONCURRENCY) {
-    const batch = targets.slice(i, i + COGNITO_CONCURRENCY);
+  for (let i = 0; i < rows.length; i += COGNITO_CONCURRENCY) {
+    const batch = rows.slice(i, i + COGNITO_CONCURRENCY);
     await Promise.all(
       batch.map(async (row) => {
-        const mobile10 =
-          normalizeMobile(row.auth?.mobile_no) ??
-          normalizeMobile(row.corp?.mobile_no);
+        const corpMobile = normalizeMobile(row.corp?.mobile_no);
         const distinctSubs = Array.from(
           new Set(
-            [norm(row.auth?.cognito_id), norm(row.corp?.cognito_id)].filter(
+            [norm(row.corp?.cognito_id), norm(row.auth?.cognito_id)].filter(
               Boolean,
             ),
           ),
         );
         const lookup: CognitoLookup = { checked: true, byMobile: [], bySub: [] };
         try {
-          if (mobile10) lookup.byMobile = await lookupByMobile(environment, mobile10);
+          if (corpMobile) lookup.byMobile = await lookupByMobile(environment, corpMobile);
           for (const sub of distinctSubs) {
             const users = await lookupBySub(environment, sub);
             lookup.bySub.push({ cognitoId: sub, users });
@@ -307,7 +282,7 @@ async function enrichWithCognito(
           lookup.error = describeCognitoError(e);
         }
         row.cognito = lookup;
-        finalizeCognitoStatuses(row);
+        applyCognitoTruth(row);
       }),
     );
   }
@@ -319,7 +294,7 @@ function dedupeStatuses(rows: AuthComparisonRow[]): void {
 
 /* ------------------------------ modes ------------------------------ */
 
-/** Mode 1: single mobile lookup across all three sources. */
+/** Mode 1: single mobile lookup — corp by mobile, then resolve auth + Cognito. */
 export async function compareByMobile(
   environment: Environment,
   mobileInput: string,
@@ -337,41 +312,51 @@ export async function compareByMobile(
     };
   }
 
-  const [authRows, corpRows] = await Promise.all([
-    fetchAuthEmployees(environment, scope, mobile10),
-    fetchCorpEmployees(environment, scope, mobile10),
-  ]);
+  const scopeWord = scope === "active" ? "active " : "";
+  const corpRows = await fetchCorpEmployees(environment, scope, mobile10);
+  if (corpRows.length === 0) {
+    return {
+      ok: true,
+      mode: "single",
+      environment,
+      scope,
+      message: `No ${scopeWord}corp employee found for ${mobile10}. (Corp is the source of truth; a mobile only present in auth is not reported.)`,
+      rows: [],
+    };
+  }
 
-  const rows = pairByShortCodeAndCompany(authRows, corpRows).map(buildComparison);
+  const shortCodes = Array.from(
+    new Set(corpRows.map((r) => norm(r.emp_shortcode)).filter(Boolean)),
+  );
+  const authRows = await fetchAuthEmployees(environment, shortCodes);
+
+  const rows = pairFromCorp(corpRows, authRows).map(buildComparison);
   await enrichWithCognito(environment, rows);
   dedupeStatuses(rows);
 
   const inconsistentCount = rows.filter((r) => r.inconsistent).length;
-  const scopeWord = scope === "active" ? "active " : "";
   return {
     ok: true,
     mode: "single",
     environment,
     scope,
-    message: rows.length
-      ? `Found ${rows.length} ${scopeWord}record${rows.length === 1 ? "" : "s"} for ${mobile10} — ${inconsistentCount} inconsistent.`
-      : `No ${scopeWord}field-force employee found for ${mobile10} in auth or corp.`,
+    message: `Found ${rows.length} ${scopeWord}corp record${rows.length === 1 ? "" : "s"} for ${mobile10} — ${inconsistentCount} inconsistent.`,
     rows,
   };
 }
 
-/** Mode 2: bulk scan — first `limit` records that differ between auth and corp. */
+/** Mode 2: bulk scan — first `limit` corp employees that differ from auth. */
 export async function scanInconsistent(
   environment: Environment,
   scope: EmployeeScope,
   limit: number = BULK_LIMIT,
 ): Promise<AuthComparisonResult> {
-  const [authRows, corpRows] = await Promise.all([
-    fetchAuthEmployees(environment, scope),
+  const [corpRows, authRows] = await Promise.all([
     fetchCorpEmployees(environment, scope),
+    fetchAuthEmployees(environment),
   ]);
 
-  const all = pairByShortCodeAndCompany(authRows, corpRows).map(buildComparison);
+  const all = pairFromCorp(corpRows, authRows).map(buildComparison);
   const inconsistentAll = all.filter((r) => r.inconsistent);
   const total = inconsistentAll.length;
   const slice = inconsistentAll.slice(0, limit);
@@ -387,7 +372,7 @@ export async function scanInconsistent(
     scope,
     totalInconsistent: total,
     truncated: total > slice.length,
-    message: `Scanned ${authRows.length} auth + ${corpRows.length} corp ${scopeWord}records. ${total} inconsistent; showing first ${slice.length}. Cognito checked only where a cognito_id exists.`,
+    message: `Scanned ${corpRows.length} corp ${scopeWord}employees against auth. ${total} inconsistent (missing in auth, or name / mobile / cognito_id differs); showing first ${slice.length}, each validated against Cognito.`,
     rows: slice,
   };
 }

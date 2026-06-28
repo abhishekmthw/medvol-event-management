@@ -5,9 +5,10 @@ import type {
 } from "./types";
 
 /**
- * Flattens an AuthComparisonResult into a spreadsheet-friendly CSV: each
- * compared field gets one column per source (auth / corp / cognito) sitting
- * side by side, followed by the per-field mismatch flags and the status notes.
+ * Flattens an AuthComparisonResult into a spreadsheet-friendly CSV. Corp is the
+ * base + source of truth (its value comes first per field); auth and the live
+ * Cognito user are compared against it. Columns: identity, presence, then each
+ * field with corp/auth/cognito values + the deviation flags, then status notes.
  * Type-only imports keep this module safe to use from the client bundle.
  */
 
@@ -15,19 +16,20 @@ const HEADERS = [
   "Short Code",
   "Company Code",
   "Present in Auth",
-  "Present in Corp",
-  "Name (Auth)",
   "Name (Corp)",
+  "Name (Auth)",
   "Name (Cognito)",
-  "Name Mismatch",
-  "Mobile (Auth)",
+  "Name Differs From Corp",
   "Mobile (Corp)",
+  "Mobile (Auth)",
   "Mobile (Cognito)",
-  "Mobile Mismatch",
-  "Cognito ID (Auth)",
+  "Mobile Differs From Corp",
   "Cognito ID (Corp)",
+  "Cognito ID (Auth)",
   "Cognito Sub (by Mobile)",
-  "Cognito ID Mismatch (Auth vs Corp)",
+  "auth vs corp cognito_id",
+  "corp cognito_id vs Cognito",
+  "auth cognito_id vs Cognito",
   "Cognito Checked",
   "Cognito Note",
   "Status",
@@ -66,19 +68,20 @@ function rowCells(r: AuthComparisonRow): string[] {
     r.shortCode,
     r.companyCode,
     yn(r.flags.presentInAuth),
-    yn(r.flags.presentInCorp),
-    r.auth?.name ?? "",
     r.corp?.emp_name ?? "",
+    r.auth?.name ?? "",
     live ? joinCognito(c.byMobile, (u) => u.name) : "",
     yn(r.flags.nameMismatch),
-    r.auth?.mobile_no ?? "",
     r.corp?.mobile_no ?? "",
+    r.auth?.mobile_no ?? "",
     live ? joinCognito(c.byMobile, (u) => u.phone_number) : "",
     yn(r.flags.mobileMismatch),
-    r.auth?.cognito_id ?? "",
     r.corp?.cognito_id ?? "",
+    r.auth?.cognito_id ?? "",
     live ? joinCognito(c.byMobile, (u) => u.sub) : "",
-    yn(r.flags.cognitoIdMismatch),
+    yn(r.flags.authCorpCognitoMismatch),
+    yn(r.flags.corpCognitoMismatch),
+    yn(r.flags.authCognitoMismatch),
     yn(c.checked),
     cogNote,
     r.statuses.join("; "),

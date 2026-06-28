@@ -7,20 +7,12 @@ import type {
   CognitoUserInfo,
 } from "@/lib/types";
 
-/** Status messages that mean the stored cognito_id disagrees with live Cognito. */
-const COGNITO_CROSSCHECK_STATUSES = new Set([
-  "auth cognito_id ≠ Cognito (by mobile)",
-  "corp cognito_id ≠ Cognito (by mobile)",
-  "cognito_id not found in Cognito",
-  "No Cognito user for mobile",
-  "Cognito phone ≠ DB mobile (by sub)",
-]);
-
 /**
- * Read-only three-way comparison table for the Auth Details Comparison tab.
- * One row per reconciled employee; each compared field stacks the auth / corp /
- * cognito values so disagreements are visible at a glance. Mismatching cells are
- * tinted red.
+ * Read-only comparison table for the Auth Details Comparison tab. Corp is the
+ * base + source of truth (shown first); auth and the live Cognito user are
+ * compared against it. One row per corp employee; each field stacks the
+ * corp / auth / cognito values, and cells that deviate from their source of
+ * truth are tinted red.
  */
 export function AuthComparisonTable({ rows }: { rows: AuthComparisonRow[] }) {
   if (rows.length === 0) {
@@ -44,88 +36,66 @@ export function AuthComparisonTable({ rows }: { rows: AuthComparisonRow[] }) {
           </tr>
         </thead>
         <tbody>
-          {rows.map((r, i) => {
-            const cognitoIdCellMismatch =
-              r.flags.cognitoIdMismatch ||
-              r.statuses.some((s) => COGNITO_CROSSCHECK_STATUSES.has(s));
+          {rows.map((r) => {
+            const cognitoMismatch =
+              r.flags.authCorpCognitoMismatch ||
+              r.flags.corpCognitoMismatch ||
+              r.flags.authCognitoMismatch;
             return (
-            <tr
-              key={`${r.key}-${i}`}
-              className="border-t border-[hsl(var(--border))] align-top hover:bg-[hsl(var(--muted))]/40"
-            >
-              <Td className="font-mono whitespace-nowrap">{r.shortCode || "—"}</Td>
-              <Td className="font-mono whitespace-nowrap">{r.companyCode || "—"}</Td>
+              <tr
+                key={r.key}
+                className="border-t border-[hsl(var(--border))] align-top hover:bg-[hsl(var(--muted))]/40"
+              >
+                <Td className="font-mono whitespace-nowrap">{r.shortCode || "—"}</Td>
+                <Td className="font-mono whitespace-nowrap">{r.companyCode || "—"}</Td>
 
-              {/* Name: auth / corp / cognito (by mobile) */}
-              <Td>
-                <Stack mismatch={r.flags.nameMismatch}>
-                  <Line label="auth" value={r.auth?.name} present={r.flags.presentInAuth} />
-                  <Line label="corp" value={r.corp?.emp_name} present={r.flags.presentInCorp} />
-                  <CognitoLine
-                    cognito={r.cognito}
-                    pick={(u) => u.name}
-                  />
-                </Stack>
-              </Td>
+                {/* Name: corp (truth) / auth / cognito (by mobile) */}
+                <Td>
+                  <Stack mismatch={r.flags.nameMismatch}>
+                    <Line label="corp" value={r.corp?.emp_name} present={r.corp != null} />
+                    <Line label="auth" value={r.auth?.name} present={r.flags.presentInAuth} />
+                    <CognitoLine cognito={r.cognito} pick={(u) => u.name} />
+                  </Stack>
+                </Td>
 
-              {/* Mobile: auth / corp / cognito (by mobile) */}
-              <Td>
-                <Stack mismatch={r.flags.mobileMismatch}>
-                  <Line
-                    label="auth"
-                    value={r.auth?.mobile_no}
-                    present={r.flags.presentInAuth}
-                    mono
-                  />
-                  <Line
-                    label="corp"
-                    value={r.corp?.mobile_no}
-                    present={r.flags.presentInCorp}
-                    mono
-                  />
-                  <CognitoLine cognito={r.cognito} pick={(u) => u.phone_number} mono />
-                </Stack>
-              </Td>
+                {/* Mobile: corp (truth) / auth / cognito (by mobile) */}
+                <Td>
+                  <Stack mismatch={r.flags.mobileMismatch}>
+                    <Line label="corp" value={r.corp?.mobile_no} present={r.corp != null} mono />
+                    <Line label="auth" value={r.auth?.mobile_no} present={r.flags.presentInAuth} mono />
+                    <CognitoLine cognito={r.cognito} pick={(u) => u.phone_number} mono />
+                  </Stack>
+                </Td>
 
-              {/* Cognito ID: auth.cognito_id / corp.cognito_id / live sub by mobile */}
-              <Td>
-                <Stack mismatch={cognitoIdCellMismatch}>
-                  <Line
-                    label="auth"
-                    value={r.auth?.cognito_id}
-                    present={r.flags.presentInAuth}
-                    mono
-                  />
-                  <Line
-                    label="corp"
-                    value={r.corp?.cognito_id}
-                    present={r.flags.presentInCorp}
-                    mono
-                  />
-                  <CognitoLine cognito={r.cognito} pick={(u) => u.sub} mono labelText="cog" />
-                </Stack>
-              </Td>
+                {/* Cognito ID: corp / auth / live sub by mobile (the truth) */}
+                <Td>
+                  <Stack mismatch={cognitoMismatch}>
+                    <Line label="corp" value={r.corp?.cognito_id} present={r.corp != null} mono />
+                    <Line label="auth" value={r.auth?.cognito_id} present={r.flags.presentInAuth} mono />
+                    <CognitoLine cognito={r.cognito} pick={(u) => u.sub} mono labelText="cog" />
+                  </Stack>
+                </Td>
 
-              {/* Status chips */}
-              <Td>
-                {r.statuses.length === 0 ? (
-                  <span className="pill bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
-                    Consistent
-                  </span>
-                ) : (
-                  <div className="flex flex-col gap-1 items-start">
-                    {r.statuses.map((s, j) => (
-                      <span
-                        key={j}
-                        className="pill bg-amber-500/15 text-amber-700 dark:text-amber-400 whitespace-nowrap"
-                      >
-                        {s}
-                      </span>
-                    ))}
-                  </div>
-                )}
-              </Td>
-            </tr>
+                {/* Status chips */}
+                <Td>
+                  {r.statuses.length === 0 ? (
+                    <span className="pill bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
+                      Consistent
+                    </span>
+                  ) : (
+                    <div className="flex flex-col gap-1 items-start">
+                      {r.statuses.map((s, j) => (
+                        <span
+                          key={j}
+                          className="pill bg-amber-500/15 text-amber-700 dark:text-amber-400 whitespace-nowrap"
+                        >
+                          {s}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                </Td>
+              </tr>
             );
           })}
         </tbody>
