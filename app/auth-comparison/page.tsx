@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import {
   AlertTriangle,
   CircleAlert,
+  Download,
   GitCompareArrows,
   Info,
   Loader2,
@@ -14,6 +15,7 @@ import {
 import { AppHeader } from "@/components/app-header";
 import { Segmented } from "@/components/segmented";
 import { AuthComparisonTable } from "@/components/auth-comparison-table";
+import { toComparisonCsv } from "@/lib/comparison-csv";
 import {
   EMPLOYEE_SCOPES,
   type AuthComparisonResult,
@@ -73,6 +75,28 @@ export default function AuthComparisonPage() {
     } finally {
       setLoading(false);
     }
+  }
+
+  function downloadCsv() {
+    if (!result || result.rows.length === 0) return;
+    const stamp = new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace(/[:T]/g, "-");
+    const mob = mobile.trim() ? `_${mobile.trim().replace(/\D/g, "")}` : "";
+    const filename = `auth-comparison_${environment}_${scope}_${result.mode}${mob}_${stamp}.csv`;
+
+    const blob = new Blob([toComparisonCsv(result)], {
+      type: "text/csv;charset=utf-8;",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
   }
 
   return (
@@ -230,6 +254,16 @@ export default function AuthComparisonPage() {
               <span className="ml-auto pill bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))]">
                 {result.mode === "bulk" ? "Bulk scan" : "Single lookup"}
               </span>
+              <button
+                type="button"
+                className="btn-ghost h-8"
+                onClick={downloadCsv}
+                disabled={result.rows.length === 0}
+                title="Download these results as a CSV"
+              >
+                <Download className="h-4 w-4" />
+                <span className="hidden sm:inline">Download CSV</span>
+              </button>
             </div>
 
             <p className="text-sm text-[hsl(var(--muted-foreground))]">
