@@ -1,27 +1,41 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   AlertTriangle,
   CircleAlert,
+  CircleStop,
   Download,
   GitCompareArrows,
   Info,
   Loader2,
   Search,
+  UserCheck,
   Users,
 } from "lucide-react";
 import { AppHeader } from "@/components/app-header";
 import { Segmented } from "@/components/segmented";
 import { AuthComparisonTable } from "@/components/auth-comparison-table";
-import { toComparisonCsv } from "@/lib/comparison-csv";
+import { EmployeeCognitoTable } from "@/components/employee-cognito-table";
+import { toComparisonCsv, toEmployeeCognitoCsv } from "@/lib/comparison-csv";
 import {
   EMPLOYEE_SCOPES,
   type AuthComparisonResult,
+  type EmployeeCognitoChunk,
+  type EmployeeCognitoRow,
   type EmployeeScope,
   type Environment,
 } from "@/lib/types";
+
+/** Progress/summary of the (possibly still running) employee ↔ Cognito scan. */
+type ScanMeta = {
+  checked: number;
+  totalWithCognitoId: number;
+  totalEmployees: number;
+  done: boolean;
+  stopped: boolean;
+};
 
 export default function AuthComparisonPage() {
   const router = useRouter();
@@ -33,8 +47,26 @@ export default function AuthComparisonPage() {
   const [result, setResult] = useState<AuthComparisonResult | null>(null);
   const [topError, setTopError] = useState<string | null>(null);
 
+  // Employee ↔ Cognito scan (chunked; the client loops until done or stopped).
+  const [scanLoading, setScanLoading] = useState(false);
+  const [scanMeta, setScanMeta] = useState<ScanMeta | null>(null);
+  const [scanRows, setScanRows] = useState<EmployeeCognitoRow[]>([]);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const scanStopRef = useRef(false);
+  /** Bumped on reset/start so a stale in-flight scan loop stops writing state. */
+  const scanGenRef = useRef(0);
+
   const isProd = environment === "prod";
   const bulkMode = mobile.trim().length === 0;
+
+  function resetScan() {
+    scanGenRef.current += 1;
+    scanStopRef.current = true;
+    setScanLoading(false);
+    setScanMeta(null);
+    setScanRows([]);
+    setScanError(null);
+  }
 
   const handleSessionExpired = useMemo(
     () => async () => {
@@ -75,6 +107,77 @@ export default function AuthComparisonPage() {
     } finally {
       setLoading(false);
     }
+  }
+
+  async function runEmployeeScan() {
+    scanGenRef.current += 1;
+    const gen = scanGenRef.current;
+    scanStopRef.current = false;
+    setScanError(null);
+    setScanRows([]);
+    setScanMeta(null);
+    setScanLoading(true);
+    const acc: EmployeeCognitoRow[] = [];
+    let offset = 0;
+    try {
+      // Walk the whole employee table one chunk per request; each response
+      // reports how far we are and where to resume.
+      for (;;) {
+        const res = await fetch("/api/auth-comparison/employee-cognito", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ environment, scope, offset }),
+        });
+        if (gen !== scanGenRef.current) return; // superseded by reset/restart
+        if (res.status === 401) {
+          await handleSessionExpired();
+          return;
+        }
+        const data = await res.json();
+        if (!res.ok) {
+          setScanError(data?.error ?? `Request failed (HTTP ${res.status}).`);
+          return;
+        }
+        const chunk = data as EmployeeCognitoChunk;
+        acc.push(...chunk.rows);
+        setScanRows([...acc]);
+
+        const done = chunk.nextOffset === null;
+        const stopped = !done && scanStopRef.current;
+        setScanMeta({
+          checked: chunk.offset + chunk.checked,
+          totalWithCognitoId: chunk.totalWithCognitoId,
+          totalEmployees: chunk.totalEmployees,
+          done,
+          stopped,
+        });
+        if (done || stopped) return;
+        offset = chunk.nextOffset!;
+      }
+    } catch (e) {
+      if (gen === scanGenRef.current) {
+        setScanError(e instanceof Error ? e.message : String(e));
+      }
+    } finally {
+      if (gen === scanGenRef.current) setScanLoading(false);
+    }
+  }
+
+  function downloadScanCsv() {
+    if (scanRows.length === 0) return;
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    const filename = `employee-cognito-check_${environment}_${scope}_${stamp}.csv`;
+    const blob = new Blob([toEmployeeCognitoCsv(scanRows)], {
+      type: "text/csv;charset=utf-8;",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
   }
 
   function downloadCsv() {
@@ -134,6 +237,7 @@ export default function AuthComparisonPage() {
                   setEnvironment(v);
                   setResult(null);
                   setTopError(null);
+                  resetScan();
                 }}
               />
             </div>
@@ -149,6 +253,7 @@ export default function AuthComparisonPage() {
                   setScope(v);
                   setResult(null);
                   setTopError(null);
+                  resetScan();
                 }}
               />
             </div>
@@ -283,6 +388,134 @@ export default function AuthComparisonPage() {
             )}
 
             <AuthComparisonTable rows={result.rows} />
+          </section>
+        )}
+
+        {/* Employee ↔ Cognito full scan */}
+        <section className="card p-5 sm:p-6 space-y-5 animate-fade-in">
+          <div className="flex items-center gap-2">
+            <UserCheck className="h-4 w-4 text-[hsl(var(--primary))]" />
+            <h2 className="text-sm font-semibold uppercase tracking-wider">
+              Employee ↔ Cognito Check
+            </h2>
+            <span className="ml-auto pill bg-sky-500/15 text-sky-600 dark:text-sky-400">
+              read-only
+            </span>
+          </div>
+
+          <p className="text-xs text-[hsl(var(--muted-foreground))]">
+            Scans <b>every</b> employee in the auth DB
+            (<code>Field_Force_Users</code>, honoring the scope above) that has a{" "}
+            <code>cognito_id</code>, looks that id up in AWS Cognito, and compares
+            the <b>mobile number</b> and <b>short code</b> between the auth record
+            and the Cognito user (<code>phone_number</code> /{" "}
+            <code>custom:emp_short_code</code>). Runs in chunks of 200 — only
+            mismatches are listed.
+          </p>
+
+          {scanError && (
+            <div
+              role="alert"
+              className="rounded-lg border border-[hsl(var(--danger))]/40 bg-[hsl(var(--danger))]/10
+                         text-[hsl(var(--danger))] px-3 py-2 text-xs flex items-start gap-2 animate-fade-in"
+            >
+              <CircleAlert className="h-4 w-4 shrink-0 mt-0.5" />
+              <span>{scanError}</span>
+            </div>
+          )}
+
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <p className="text-xs text-[hsl(var(--muted-foreground))]">
+              {scanLoading && scanMeta ? (
+                <>
+                  Checked <b>{scanMeta.checked}</b> of{" "}
+                  <b>{scanMeta.totalWithCognitoId}</b> employees with a
+                  cognito_id — {scanRows.length} mismatch
+                  {scanRows.length === 1 ? "" : "es"} so far…
+                </>
+              ) : (
+                <>Read-only — no database or Cognito writes are performed.</>
+              )}
+            </p>
+            <div className="flex items-center gap-2">
+              {scanLoading && (
+                <button
+                  type="button"
+                  className="btn-ghost h-9"
+                  onClick={() => {
+                    scanStopRef.current = true;
+                  }}
+                >
+                  <CircleStop className="h-4 w-4" />
+                  Stop
+                </button>
+              )}
+              <button
+                type="button"
+                className="btn-primary min-w-[170px]"
+                onClick={runEmployeeScan}
+                disabled={scanLoading}
+              >
+                {scanLoading ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Scanning…
+                  </>
+                ) : (
+                  <>
+                    <Search className="h-4 w-4" />
+                    Check all employees
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </section>
+
+        {/* Employee ↔ Cognito results */}
+        {scanMeta && !scanLoading && (
+          <section className="card p-5 sm:p-6 space-y-4 animate-fade-in">
+            <div className="flex items-center gap-2">
+              <h2 className="text-sm font-semibold uppercase tracking-wider">
+                Employee ↔ Cognito Results
+              </h2>
+              <span className="ml-auto pill bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))]">
+                {scanMeta.done
+                  ? "Full scan"
+                  : scanMeta.stopped
+                    ? "Stopped early"
+                    : "Partial scan"}
+              </span>
+              <button
+                type="button"
+                className="btn-ghost h-8"
+                onClick={downloadScanCsv}
+                disabled={scanRows.length === 0}
+                title="Download these mismatches as a CSV"
+              >
+                <Download className="h-4 w-4" />
+                <span className="hidden sm:inline">Download CSV</span>
+              </button>
+            </div>
+
+            <p className="text-sm text-[hsl(var(--muted-foreground))]">
+              Checked {scanMeta.checked} of {scanMeta.totalWithCognitoId}{" "}
+              {scope === "active" ? "active " : ""}employees with a cognito_id
+              ({scanMeta.totalEmployees} in scope overall) against Cognito —{" "}
+              {scanRows.length} with a mobile / short-code mismatch, a stale
+              cognito_id, or a lookup error.
+            </p>
+
+            {!scanMeta.done && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-400 flex items-start gap-2">
+                <Info className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+                The scan {scanMeta.stopped ? "was stopped" : "ended"} before
+                completing — {scanMeta.totalWithCognitoId - scanMeta.checked}{" "}
+                employees were not checked. Run it again to cover the full table.
+              </div>
+            )}
+
+            <EmployeeCognitoTable rows={scanRows} />
           </section>
         )}
       </div>

@@ -70,6 +70,7 @@ function parseUser(u: UserType): CognitoUserInfo {
     sub: attrs.get("sub") || null,
     name: attrs.get("name") || null,
     phone_number: attrs.get("phone_number") || null,
+    emp_short_code: attrs.get("custom:emp_short_code") || null,
     username: u.Username ?? null,
     status: u.UserStatus ?? null,
     enabled: u.Enabled ?? null,

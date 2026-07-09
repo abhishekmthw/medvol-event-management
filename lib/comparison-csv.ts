@@ -2,6 +2,7 @@ import type {
   AuthComparisonResult,
   AuthComparisonRow,
   CognitoUserInfo,
+  EmployeeCognitoRow,
 } from "./types";
 
 /**
@@ -94,5 +95,53 @@ const BOM = String.fromCharCode(0xfeff);
 export function toComparisonCsv(result: AuthComparisonResult): string {
   const rows = [HEADERS, ...result.rows.map(rowCells)];
   const body = rows.map((cells) => cells.map(csvCell).join(",")).join("\r\n");
+  return BOM + body + "\r\n";
+}
+
+/* ------------- Employee ↔ Cognito Check (mismatches only) ------------- */
+
+const EMP_COGNITO_HEADERS = [
+  "Auth ID",
+  "Company Code",
+  "Name (Auth)",
+  "Short Code (Auth)",
+  "Short Code (Cognito)",
+  "Short Code Mismatch",
+  "Mobile (Auth)",
+  "Mobile (Cognito)",
+  "Mobile Mismatch",
+  "Cognito ID (Auth)",
+  "Found in Cognito",
+  "Cognito Username",
+  "Cognito Status",
+  "Cognito Enabled",
+  "Cognito Note",
+  "Status",
+];
+
+function empCognitoRowCells(r: EmployeeCognitoRow): string[] {
+  return [
+    r.auth.id,
+    r.auth.company_code ?? "",
+    r.auth.name ?? "",
+    r.auth.short_code ?? "",
+    r.cognito?.emp_short_code ?? "",
+    yn(r.flags.shortCodeMismatch),
+    r.auth.mobile_no ?? "",
+    r.cognito?.phone_number ?? "",
+    yn(r.flags.mobileMismatch),
+    r.auth.cognito_id ?? "",
+    yn(r.cognito !== null),
+    r.cognito?.username ?? "",
+    r.cognito?.status ?? "",
+    r.cognito ? yn(r.cognito.enabled !== false) : "",
+    r.error ?? "",
+    r.statuses.join("; "),
+  ];
+}
+
+export function toEmployeeCognitoCsv(rows: EmployeeCognitoRow[]): string {
+  const all = [EMP_COGNITO_HEADERS, ...rows.map(empCognitoRowCells)];
+  const body = all.map((cells) => cells.map(csvCell).join(",")).join("\r\n");
   return BOM + body + "\r\n";
 }

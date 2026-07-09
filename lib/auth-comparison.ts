@@ -5,7 +5,10 @@ import type {
   AuthComparisonRow,
   AuthEmployeeRow,
   CognitoLookup,
+  CognitoUserInfo,
   CorpEmployeeRow,
+  EmployeeCognitoChunk,
+  EmployeeCognitoRow,
   EmployeeScope,
   Environment,
 } from "./types";
@@ -374,5 +377,144 @@ export async function scanInconsistent(
     truncated: total > slice.length,
     message: `Scanned ${corpRows.length} corp ${scopeWord}employees against auth. ${total} inconsistent (missing in auth, or name / mobile / cognito_id differs); showing first ${slice.length}, each validated against Cognito.`,
     rows: slice,
+  };
+}
+
+/* -------------------- Employee ↔ Cognito full scan -------------------- */
+
+/**
+ * Mode 3: chunked full scan of the auth employee table against Cognito.
+ * Every `Field_Force_Users` row (in scope) that has a cognito_id is looked up
+ * in Cognito by that sub, and its mobile number and short code are compared
+ * against the live Cognito user (`phone_number` / `custom:emp_short_code`).
+ *
+ * Checking "all users" can mean thousands of ListUsers calls, so one API call
+ * processes only `EMP_COGNITO_CHUNK` employees (ordered by id, LIMIT/OFFSET)
+ * and returns `nextOffset` for the client to continue — the whole table is
+ * covered across requests without any single one hitting a serverless timeout.
+ * Only mismatched rows are returned. Read-only throughout.
+ */
+export const EMP_COGNITO_CHUNK = 200;
+
+async function fetchAuthEmployeeChunk(
+  environment: Environment,
+  scope: EmployeeScope,
+  offset: number,
+): Promise<{ totalEmployees: number; totalWithCognitoId: number; rows: AuthEmployeeRow[] }> {
+  const pool = getAuthPool(environment);
+  const schema = authSchema(environment);
+  const scopeWhere = scope === "active" ? `AND active_status = 'Y'` : "";
+  const hasCognitoWhere = `cognito_id IS NOT NULL AND btrim(cognito_id) <> ''`;
+  // Schema is a validated identifier; the table name is a fixed constant; values
+  // are parameterized. Totals are recomputed per chunk (cheap counts) so the
+  // client never needs a second endpoint.
+  const countSql = `
+    SELECT
+      count(*) FILTER (WHERE true ${scopeWhere})::int AS total_employees,
+      count(*) FILTER (WHERE ${hasCognitoWhere} ${scopeWhere})::int AS total_with_cognito
+    FROM "${schema}"."Field_Force_Users"`;
+  const chunkSql = `
+    SELECT
+      id::text AS id,
+      short_code,
+      company_code::text AS company_code,
+      name,
+      mobile_no,
+      cognito_id,
+      active_status
+    FROM "${schema}"."Field_Force_Users"
+    WHERE ${hasCognitoWhere} ${scopeWhere}
+    ORDER BY id
+    LIMIT $1 OFFSET $2`;
+  const [countRes, chunkRes] = await Promise.all([
+    pool.query(countSql),
+    pool.query(chunkSql, [EMP_COGNITO_CHUNK, offset]),
+  ]);
+  return {
+    totalEmployees: countRes.rows[0]?.total_employees ?? 0,
+    totalWithCognitoId: countRes.rows[0]?.total_with_cognito ?? 0,
+    rows: chunkRes.rows as AuthEmployeeRow[],
+  };
+}
+
+function buildEmployeeCognitoRow(
+  auth: AuthEmployeeRow,
+  lookup: { users: CognitoUserInfo[]; error?: string },
+): EmployeeCognitoRow {
+  const cognito = lookup.users[0] ?? null;
+  const flags = {
+    notFoundInCognito: !lookup.error && cognito === null,
+    mobileMismatch:
+      cognito !== null &&
+      normalizeMobile(auth.mobile_no) !== normalizeMobile(cognito.phone_number),
+    shortCodeMismatch:
+      cognito !== null &&
+      norm(auth.short_code).toUpperCase() !==
+        norm(cognito.emp_short_code).toUpperCase(),
+  };
+
+  const statuses: string[] = [];
+  if (lookup.error) statuses.push("Cognito lookup error");
+  if (flags.notFoundInCognito) statuses.push("cognito_id not found in Cognito");
+  if (flags.mobileMismatch) statuses.push("Mobile ≠ Cognito");
+  if (flags.shortCodeMismatch) statuses.push("Short code ≠ Cognito");
+
+  return {
+    key: auth.id,
+    auth,
+    cognito,
+    error: lookup.error,
+    flags,
+    statuses,
+  };
+}
+
+/** Process one chunk: fetch employees, look each sub up in Cognito, compare. */
+export async function checkEmployeesAgainstCognito(
+  environment: Environment,
+  scope: EmployeeScope,
+  offset: number,
+): Promise<EmployeeCognitoChunk> {
+  const { totalEmployees, totalWithCognitoId, rows } =
+    await fetchAuthEmployeeChunk(environment, scope, offset);
+
+  // One Cognito lookup per DISTINCT sub (two auth rows can share a cognito_id),
+  // in bounded-concurrency batches. A per-sub failure is captured on the rows
+  // that reference it, never thrown.
+  const subs = Array.from(new Set(rows.map((r) => norm(r.cognito_id))));
+  const lookups = new Map<string, { users: CognitoUserInfo[]; error?: string }>();
+  for (let i = 0; i < subs.length; i += COGNITO_CONCURRENCY) {
+    const batch = subs.slice(i, i + COGNITO_CONCURRENCY);
+    await Promise.all(
+      batch.map(async (sub) => {
+        try {
+          lookups.set(sub, { users: await lookupBySub(environment, sub) });
+        } catch (e) {
+          lookups.set(sub, { users: [], error: describeCognitoError(e) });
+        }
+      }),
+    );
+  }
+
+  const mismatched = rows
+    .map((auth) =>
+      buildEmployeeCognitoRow(
+        auth,
+        lookups.get(norm(auth.cognito_id)) ?? { users: [] },
+      ),
+    )
+    .filter((r) => r.statuses.length > 0);
+
+  const end = offset + rows.length;
+  return {
+    ok: true,
+    environment,
+    scope,
+    totalEmployees,
+    totalWithCognitoId,
+    offset,
+    checked: rows.length,
+    nextOffset: end < totalWithCognitoId && rows.length > 0 ? end : null,
+    rows: mismatched,
   };
 }

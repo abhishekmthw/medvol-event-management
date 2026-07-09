@@ -260,6 +260,8 @@ export type CognitoUserInfo = {
   sub: string | null;
   name: string | null;
   phone_number: string | null;
+  /** `custom:emp_short_code` — the field-force short code stored on the Cognito user. */
+  emp_short_code: string | null;
   username: string | null;
   status: string | null;
   enabled: boolean | null;
@@ -330,4 +332,56 @@ export type AuthComparisonResult = {
   /** Bulk mode: true when results were capped at the limit. */
   truncated?: boolean;
   rows: AuthComparisonRow[];
+};
+
+/* ------------------------------------------------------------------ *
+ * Employee ↔ Cognito Check — READ-ONLY scan of ALL auth employees
+ * (Field_Force_Users) that have a cognito_id: each is looked up in
+ * Cognito by sub, then mobile number and short code are compared
+ * between the auth record and the live Cognito user. The scan is
+ * chunked (one API call per chunk) so the client can walk the whole
+ * table without hitting serverless timeouts.
+ * ------------------------------------------------------------------ */
+
+/** Disagreement flags for one auth employee vs its live Cognito user. */
+export type EmployeeCognitoFlags = {
+  /** The stored cognito_id matched no Cognito user (stale sub). */
+  notFoundInCognito: boolean;
+  /** auth.mobile_no differs from the Cognito phone_number. */
+  mobileMismatch: boolean;
+  /** auth.short_code differs from Cognito custom:emp_short_code. */
+  shortCodeMismatch: boolean;
+};
+
+/** One auth employee checked against Cognito (only mismatches are returned). */
+export type EmployeeCognitoRow = {
+  /** Unique row key (auth Field_Force_Users.id). */
+  key: string;
+  auth: AuthEmployeeRow;
+  /** The Cognito user matched by sub, or null when not found / lookup failed. */
+  cognito: CognitoUserInfo | null;
+  /** Non-fatal Cognito error for this record (lookup skipped comparison). */
+  error?: string;
+  flags: EmployeeCognitoFlags;
+  /** Human-readable status chips (e.g. "Mobile ≠ Cognito"). */
+  statuses: string[];
+};
+
+/** One chunk of the employee ↔ Cognito scan. */
+export type EmployeeCognitoChunk = {
+  ok: boolean;
+  environment: Environment;
+  scope: EmployeeScope;
+  /** Employees in scope (regardless of cognito_id) — context only. */
+  totalEmployees: number;
+  /** Employees in scope that have a cognito_id — the scan base. */
+  totalWithCognitoId: number;
+  /** Offset of this chunk within the scan base. */
+  offset: number;
+  /** Employees checked in this chunk. */
+  checked: number;
+  /** Offset to request next, or null when the scan is complete. */
+  nextOffset: number | null;
+  /** Mismatched employees found in this chunk. */
+  rows: EmployeeCognitoRow[];
 };
