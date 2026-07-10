@@ -1,11 +1,12 @@
 import { authSchema, getAuthPool, getPool } from "./db";
-import { describeCognitoError, lookupByMobile } from "./cognito";
+import { describeCognitoError, lookupByMobile, lookupBySub } from "./cognito";
 import { norm, normalizeMobile, pairKey } from "./auth-comparison";
 import { displayMobile10, normalizeName } from "./format";
 import { sendAuthQueueMessage } from "./sqs";
 import type {
   CognitoUserInfo,
   CorrectionAnalyzeResult,
+  CorrectionClearResult,
   CorrectionConflict,
   CorrectionEmployee,
   CorrectionEventSummary,
@@ -13,6 +14,7 @@ import type {
   CorrectionFixResult,
   CorrectionReleaseResult,
   CorrectionReplayResult,
+  CorrectionStoredSubOwner,
   CorrectionSyncChange,
   CorrectionSyncResult,
   Environment,
@@ -261,6 +263,66 @@ async function findCorrectionConflicts(
   ];
 }
 
+/* ---------------------- stored-sub owner resolution ---------------------- */
+
+/**
+ * Look each stored cognito_id (corp / auth) up in Cognito BY SUB — needed when
+ * the mobile lookup resolves nothing: the stored sub may be stale (no Cognito
+ * user) or belong to an entirely different user. A sub is `wrong` when it is
+ * confirmed stale or its owner's `custom:emp_short_code` differs from the
+ * corp short code; a lookup error leaves `wrong` false (never clear on
+ * uncertainty). Shared by analyze (display + action flag) and
+ * `clearWrongCognitoId` (apply) so they can't disagree.
+ */
+async function resolveStoredSubOwners(
+  environment: Environment,
+  corpStored: string,
+  authStored: string,
+  targetSub: string,
+  corpShortCode: string | null,
+): Promise<CorrectionStoredSubOwner[]> {
+  const bySub = new Map<string, ("corp" | "auth")[]>();
+  if (corpStored && corpStored !== targetSub) bySub.set(corpStored, ["corp"]);
+  if (authStored && authStored !== targetSub) {
+    const existing = bySub.get(authStored);
+    if (existing) existing.push("auth");
+    else bySub.set(authStored, ["auth"]);
+  }
+
+  const owners: CorrectionStoredSubOwner[] = [];
+  for (const [sub, sources] of bySub) {
+    try {
+      const users = await lookupBySub(environment, sub);
+      const user = users[0] ?? null;
+      owners.push({
+        sub,
+        sources,
+        user,
+        wrong: user === null || !sameCode(user.emp_short_code, corpShortCode),
+      });
+    } catch (e) {
+      owners.push({
+        sub,
+        sources,
+        user: null,
+        wrong: false,
+        error: describeCognitoError(e),
+      });
+    }
+  }
+  return owners;
+}
+
+/** Why a stored sub is wrong — used in statuses and the clear preview. */
+function describeWrongSub(owner: CorrectionStoredSubOwner): string {
+  if (owner.user === null) return "not found in Cognito (stale)";
+  const bits = [
+    norm(owner.user.emp_short_code) || "no short code",
+    displayMobile10(owner.user.phone_number) ?? "no mobile",
+  ];
+  return `belongs to a different Cognito user (${bits.join(", ")})`;
+}
+
 function describeConflicts(conflicts: CorrectionConflict[]): string {
   return conflicts
     .map((c) => {
@@ -445,10 +507,10 @@ function buildEmployee(
     } else if (authMatches.length > 1) {
       fixBlockedReason = "Multiple auth records match — resolve the duplicate first";
     }
-  } else if (sub === "" && (norm(corp.cognito_id) || norm(auth?.cognito_id))) {
-    // A cognito_id is stored somewhere but no live user could be resolved.
-    statuses.push("Stored cognito_id could not be validated against Cognito");
   }
+  // When sub === "" but a cognito_id is stored somewhere, the analyze
+  // post-pass looks the stored sub(s) up in Cognito by sub and pushes
+  // precise statuses (stale / different owner) + the clear action.
 
   // Auth-side drift on an EXISTING record (name / mobile / ucode) is fixed by
   // a direct sync from corp. Cognito-side name/ucode drift is surfaced but
@@ -478,6 +540,8 @@ function buildEmployee(
     authMatchCount: authMatches.length,
     cognitoTarget: target,
     cognitoByMobileCount: cog.byMobile.length,
+    // Filled by the analyze post-pass (needs async Cognito lookups).
+    storedSubOwners: [],
     fields,
     actions: {
       createInAuth: !presentInAuth,
@@ -488,6 +552,8 @@ function buildEmployee(
       cognitoAttributeDrift,
       // Set by the analyze post-pass when the live sub is found duplicated.
       releaseDuplicateCognitoId: false,
+      // Set by the analyze post-pass when the stored sub is stale/foreign.
+      clearWrongCognitoId: false,
     },
     blockers,
     statuses,
@@ -579,6 +645,46 @@ export async function analyzeByMobile(
       }
       emp.consistent = false;
     }
+  }
+
+  // Stored-sub audit: every stored cognito_id that differs from the resolved
+  // target is looked up in Cognito BY SUB, so the operator sees whether it is
+  // stale or belongs to a different user entirely. When NO rightful Cognito
+  // user exists for this employee and every stored sub is confirmed wrong,
+  // the clear action is offered.
+  for (const emp of employees) {
+    const targetSub = norm(emp.cognitoTarget?.sub);
+    const idField = emp.fields.find((f) => f.key === "cognitoId");
+    const owners = await resolveStoredSubOwners(
+      environment,
+      norm(idField?.corp.value),
+      norm(idField?.auth.value),
+      targetSub,
+      emp.shortCode,
+    );
+    emp.storedSubOwners = owners;
+    if (owners.length === 0) continue;
+
+    for (const o of owners) {
+      const sides = o.sources.join(" + ");
+      if (o.error) {
+        emp.statuses.push(
+          `Stored cognito_id (${sides}) could not be validated — Cognito lookup error`,
+        );
+      } else if (o.wrong) {
+        emp.statuses.push(`${sides} cognito_id ${describeWrongSub(o)}`);
+      } else {
+        // Owner matches the corp short code but wasn't found by the corp
+        // mobile — the Cognito phone_number is outdated. Not clearable.
+        emp.statuses.push(
+          `${sides} cognito_id belongs to a matching user whose Cognito mobile is ${displayMobile10(o.user?.phone_number) ?? "—"} — update the phone in Cognito manually`,
+        );
+      }
+    }
+    if (!targetSub && owners.some((o) => o.wrong)) {
+      emp.actions.clearWrongCognitoId = true;
+    }
+    emp.consistent = false;
   }
 
   const needFix = employees.filter((e) => !e.consistent).length;
@@ -1050,6 +1156,138 @@ export async function releaseDuplicateCognitoId(
     message: `Cleared cognito_id on ${cleared} record${cleared === 1 ? "" : "s"} — ${norm(corp.emp_shortcode)} is now the only holder of ${sub}.`,
     sub,
     conflicts,
+    cleared,
+    preview: false,
+  };
+}
+
+/* ------------------- action 5: clear wrong cognito_id ------------------- */
+
+/**
+ * NULL the cognito_id stored on THIS employee's corp/auth records when it is
+ * confirmed wrong — either the sub no longer exists in Cognito (stale) or it
+ * belongs to a different user (its owner's `custom:emp_short_code` ≠ corp
+ * short code). Only offered/applied when NO rightful Cognito user resolves
+ * for this employee (if one does, `fixCognitoId` overwrites instead of
+ * clearing). Only the wrong side(s) are touched, and each UPDATE carries an
+ * `AND cognito_id = <sub>` predicate so a concurrently-corrected row is never
+ * clobbered. A Cognito lookup error never clears anything.
+ */
+export async function clearWrongCognitoId(
+  environment: Environment,
+  empmasterId: string,
+  preview: boolean,
+): Promise<CorrectionClearResult> {
+  const fail = (message: string): CorrectionClearResult => ({
+    ok: false,
+    message,
+    targets: [],
+    cleared: 0,
+    preview,
+  });
+
+  const corp = await fetchCorpById(environment, empmasterId);
+  if (!corp) return fail(`No corp employee with empmaster_id ${empmasterId}.`);
+
+  const authMatches = (
+    await fetchAuthByShortCodes(environment, [norm(corp.emp_shortcode)].filter(Boolean))
+  ).filter(
+    (a) =>
+      pairKey(a.short_code, a.company_code) ===
+      pairKey(corp.emp_shortcode, corp.company_code),
+  );
+  if (authMatches.length > 1) {
+    return fail(
+      `${authMatches.length} auth records match (short code, company code) — resolve the duplicate manually.`,
+    );
+  }
+  const auth = authMatches[0] ?? null;
+
+  const mobile10 = normalizeMobile(corp.mobile_no);
+  const cog = await resolveCognito(environment, mobile10, corp.emp_shortcode);
+  if (cog.error) return fail(cog.error);
+  if (cog.target && norm(cog.target.sub)) {
+    return fail(
+      "A live Cognito user was resolved for this employee — use “Fix cognito_id in corp + auth” instead of clearing.",
+    );
+  }
+
+  const corpStored = norm(corp.cognito_id);
+  const authStored = norm(auth?.cognito_id);
+  if (!corpStored && !authStored) {
+    return {
+      ok: true,
+      message: "No cognito_id is stored on this employee — nothing to clear.",
+      targets: [],
+      cleared: 0,
+      preview,
+    };
+  }
+
+  const owners = await resolveStoredSubOwners(
+    environment,
+    corpStored,
+    authStored,
+    "",
+    corp.emp_shortcode,
+  );
+  const lookupError = owners.find((o) => o.error);
+  if (lookupError) return fail(lookupError.error!);
+
+  const targets: CorrectionClearResult["targets"] = [];
+  for (const o of owners) {
+    if (!o.wrong) continue;
+    const reason = describeWrongSub(o);
+    for (const source of o.sources) {
+      if (source === "corp") {
+        targets.push({ source, id: corp.empmaster_id, sub: o.sub, reason });
+      } else if (auth) {
+        targets.push({ source, id: auth.id, sub: o.sub, reason });
+      }
+    }
+  }
+  if (targets.length === 0) {
+    return fail(
+      "The stored cognito_id belongs to a Cognito user with this short code (only the Cognito mobile differs) — update the phone in Cognito manually instead of clearing.",
+    );
+  }
+
+  if (preview) {
+    return {
+      ok: true,
+      message: `Would set cognito_id to NULL on ${targets.length} record${targets.length === 1 ? "" : "s"} of ${norm(corp.emp_shortcode)} (the stored sub is not this employee's).`,
+      targets,
+      cleared: 0,
+      preview: true,
+    };
+  }
+
+  let cleared = 0;
+  for (const t of targets) {
+    if (t.source === "corp") {
+      const pool = getPool({ environment, service: "corp", instance: null });
+      const res = await pool.query(
+        `UPDATE public.empmaster_hdr SET cognito_id = NULL
+         WHERE empmaster_id = $1::integer AND cognito_id = $2`,
+        [t.id, t.sub],
+      );
+      cleared += res.rowCount ?? 0;
+    } else {
+      const pool = getAuthPool(environment);
+      const schema = authSchema(environment);
+      const res = await pool.query(
+        `UPDATE "${schema}"."Field_Force_Users" SET cognito_id = NULL
+         WHERE id = $1::integer AND cognito_id = $2`,
+        [t.id, t.sub],
+      );
+      cleared += res.rowCount ?? 0;
+    }
+  }
+
+  return {
+    ok: true,
+    message: `Cleared the wrong cognito_id on ${cleared} record${cleared === 1 ? "" : "s"} of ${norm(corp.emp_shortcode)}. If this employee should have a Cognito account, it must be signed up / corrected separately; to fix the sub's real owner, analyze their mobile number.`,
+    targets,
     cleared,
     preview: false,
   };

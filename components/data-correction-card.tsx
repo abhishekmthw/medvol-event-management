@@ -11,8 +11,10 @@ import {
   Search,
   Wrench,
 } from "lucide-react";
+import { displayMobile10 } from "@/lib/format";
 import type {
   CorrectionAnalyzeResult,
+  CorrectionClearResult,
   CorrectionEmployee,
   CorrectionField,
   CorrectionFixResult,
@@ -35,7 +37,7 @@ import type {
  *      short code) into corp and auth.
  */
 
-type ActionKind = "replay" | "fix" | "sync" | "release";
+type ActionKind = "replay" | "fix" | "sync" | "release" | "clear";
 
 type ActionState = {
   kind: ActionKind;
@@ -50,6 +52,8 @@ type ActionState = {
   syncResult?: CorrectionSyncResult;
   releasePreview?: CorrectionReleaseResult;
   releaseResult?: CorrectionReleaseResult;
+  clearPreview?: CorrectionClearResult;
+  clearResult?: CorrectionClearResult;
   error?: string;
 };
 
@@ -376,6 +380,62 @@ export function DataCorrectionCard({
     }
   }
 
+  /* ----------------------- clear wrong cognito_id ----------------------- */
+
+  async function startClear(emp: CorrectionEmployee) {
+    setPollNote(null);
+    setAction({
+      kind: "clear",
+      empmasterId: emp.empmasterId,
+      shortCode: emp.shortCode,
+      phase: "previewing",
+    });
+    try {
+      const preview = await post<CorrectionClearResult>(
+        "/api/auth-comparison/correction/clear-cognito",
+        { environment, empmasterId: emp.empmasterId, preview: true },
+      );
+      if (preview === null) return;
+      if (!preview.ok || preview.targets.length === 0) {
+        setAction((a) => a && { ...a, phase: "done", error: preview.message });
+        return;
+      }
+      setAction((a) => a && { ...a, phase: "confirm", clearPreview: preview });
+    } catch (e) {
+      setAction(
+        (a) =>
+          a && {
+            ...a,
+            phase: "done",
+            error: e instanceof Error ? e.message : String(e),
+          },
+      );
+    }
+  }
+
+  async function confirmClear() {
+    if (!action || action.kind !== "clear") return;
+    setAction({ ...action, phase: "running" });
+    try {
+      const run = await post<CorrectionClearResult>(
+        "/api/auth-comparison/correction/clear-cognito",
+        { environment, empmasterId: action.empmasterId, preview: false },
+      );
+      if (run === null) return;
+      setAction((a) => a && { ...a, phase: "done", clearResult: run });
+      await analyze(true);
+    } catch (e) {
+      setAction(
+        (a) =>
+          a && {
+            ...a,
+            phase: "done",
+            error: e instanceof Error ? e.message : String(e),
+          },
+      );
+    }
+  }
+
   const busy =
     analyzing ||
     polling ||
@@ -509,6 +569,7 @@ export function DataCorrectionCard({
               onFixCognito={() => startFix(emp)}
               onSyncAuth={() => startSync(emp)}
               onReleaseDuplicate={() => startRelease(emp)}
+              onClearWrong={() => startClear(emp)}
             />
           ))}
         </div>
@@ -528,7 +589,9 @@ export function DataCorrectionCard({
                 ? confirmFix
                 : action.kind === "sync"
                   ? confirmSync
-                  : confirmRelease
+                  : action.kind === "release"
+                    ? confirmRelease
+                    : confirmClear
           }
         />
       )}
@@ -547,6 +610,7 @@ function EmployeePanel({
   onFixCognito,
   onSyncAuth,
   onReleaseDuplicate,
+  onClearWrong,
 }: {
   emp: CorrectionEmployee;
   isProd: boolean;
@@ -556,6 +620,7 @@ function EmployeePanel({
   onFixCognito: () => void;
   onSyncAuth: () => void;
   onReleaseDuplicate: () => void;
+  onClearWrong: () => void;
 }) {
   const working = action?.phase === "previewing" || action?.phase === "running";
   return (
@@ -585,6 +650,55 @@ function EmployeePanel({
       </div>
 
       <FieldTable fields={emp.fields} />
+
+      {/* Who actually owns the stored cognito_id (looked up by sub). */}
+      {emp.storedSubOwners.length > 0 && (
+        <div className="rounded-lg border border-[hsl(var(--border))] px-3 py-2 space-y-1.5 text-xs">
+          <p className="font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wide text-[10px]">
+            Stored cognito_id owner{emp.storedSubOwners.length === 1 ? "" : "s"}
+          </p>
+          {emp.storedSubOwners.map((o) => (
+            <div key={o.sub} className="leading-snug">
+              <span className="font-mono break-all">{o.sub}</span>{" "}
+              <span className="text-[hsl(var(--muted-foreground))]">
+                (stored in {o.sources.join(" + ")})
+              </span>{" "}
+              {o.error ? (
+                <span className="text-red-600 dark:text-red-400">
+                  — lookup failed
+                </span>
+              ) : o.user === null ? (
+                <span className="text-amber-700 dark:text-amber-400">
+                  — not found in Cognito (stale)
+                </span>
+              ) : (
+                <>
+                  — belongs to Cognito user{" "}
+                  <span className="font-mono">
+                    {o.user.emp_short_code?.trim() || o.user.username || "—"}
+                  </span>
+                  {o.user.name?.trim() ? <> ({o.user.name})</> : null}
+                  {o.user.phone_number ? (
+                    <>
+                      , mobile{" "}
+                      <span className="font-mono">
+                        {displayMobile10(o.user.phone_number)}
+                      </span>
+                      {o.wrong && (
+                        <span className="text-[hsl(var(--muted-foreground))]">
+                          {" "}
+                          — analyze that mobile to correct the owner&apos;s
+                          records
+                        </span>
+                      )}
+                    </>
+                  ) : null}
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
 
       {(emp.statuses.length > 0 || emp.blockers.length > 0) && (
         <div className="flex flex-wrap gap-1.5">
@@ -616,7 +730,8 @@ function EmployeePanel({
               (action.kind === "replay" && !action.replayResult?.ok) ||
               (action.kind === "fix" && !action.fixResult?.ok) ||
               (action.kind === "sync" && !action.syncResult?.ok) ||
-              (action.kind === "release" && !action.releaseResult?.ok)
+              (action.kind === "release" && !action.releaseResult?.ok) ||
+              (action.kind === "clear" && !action.clearResult?.ok)
               ? "border border-[hsl(var(--danger))]/40 bg-[hsl(var(--danger))]/10 text-[hsl(var(--danger))]"
               : "border border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400",
           )}
@@ -630,7 +745,9 @@ function EmployeePanel({
                   ? action.fixResult?.message
                   : action.kind === "sync"
                     ? action.syncResult?.message
-                    : action.releaseResult?.message)}
+                    : action.kind === "release"
+                      ? action.releaseResult?.message
+                      : action.clearResult?.message)}
           </span>
         </div>
       )}
@@ -673,6 +790,19 @@ function EmployeePanel({
               <Loader2 className="h-4 w-4 animate-spin" />
             ) : null}
             Release duplicate cognito_id
+          </button>
+        )}
+        {emp.actions.clearWrongCognitoId && (
+          <button
+            type="button"
+            className={isProd ? "btn-danger" : "btn-primary"}
+            onClick={onClearWrong}
+            disabled={busy}
+          >
+            {working && action?.kind === "clear" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : null}
+            Clear wrong cognito_id
           </button>
         )}
         {emp.actions.fixCognitoId && (
@@ -812,10 +942,12 @@ function ConfirmModal({
   const isReplay = action.kind === "replay";
   const isSync = action.kind === "sync";
   const isRelease = action.kind === "release";
+  const isClear = action.kind === "clear";
   const rp = action.replayPreview;
   const fp = action.fixPreview;
   const sp = action.syncPreview;
   const lp = action.releasePreview;
+  const cp = action.clearPreview;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
       <div className="card w-full max-w-lg p-5 space-y-4 max-h-[85vh] overflow-y-auto">
@@ -833,7 +965,9 @@ function ConfirmModal({
                 ? `Sync auth with corp — ${action.shortCode}`
                 : isRelease
                   ? `Release duplicate cognito_id — ${action.shortCode}`
-                  : `Fix cognito_id — ${action.shortCode}`}
+                  : isClear
+                    ? `Clear wrong cognito_id — ${action.shortCode}`
+                    : `Fix cognito_id — ${action.shortCode}`}
           </h3>
           <span
             className={clsx(
@@ -961,6 +1095,49 @@ function ConfirmModal({
           </>
         )}
 
+        {isClear && cp && (
+          <>
+            <p className="text-xs text-[hsl(var(--muted-foreground))]">
+              No Cognito user belongs to <b>{action.shortCode}</b>, and the
+              stored cognito_id is not this employee&apos;s. It will be set to{" "}
+              <b>NULL</b> on the record{cp.targets.length === 1 ? "" : "s"}{" "}
+              below:
+            </p>
+            <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
+                  <tr>
+                    <th className="text-left font-medium px-3 py-1.5">Source</th>
+                    <th className="text-left font-medium px-3 py-1.5">Record</th>
+                    <th className="text-left font-medium px-3 py-1.5">Stored cognito_id</th>
+                    <th className="text-left font-medium px-3 py-1.5">Why wrong</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {cp.targets.map((t) => (
+                    <tr
+                      key={`${t.source}-${t.id}`}
+                      className="border-t border-[hsl(var(--border))]"
+                    >
+                      <td className="px-3 py-1.5 whitespace-nowrap">
+                        {t.source === "corp" ? "corp empmaster_hdr" : "auth Field_Force_Users"}
+                      </td>
+                      <td className="px-3 py-1.5 font-mono">{t.id}</td>
+                      <td className="px-3 py-1.5 font-mono break-all">{t.sub}</td>
+                      <td className="px-3 py-1.5">{t.reason}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
+              If the sub belongs to another user, correct that user by analyzing
+              their mobile number afterwards. If this employee should have a
+              Cognito account, it must be created via signup separately.
+            </p>
+          </>
+        )}
+
         {action.kind === "fix" && fp && (
           <>
             <p className="text-xs text-[hsl(var(--muted-foreground))]">
@@ -1018,7 +1195,9 @@ function ConfirmModal({
                 ? "Confirm sync"
                 : isRelease
                   ? "Confirm release"
-                  : "Confirm update"}
+                  : isClear
+                    ? "Confirm clear"
+                    : "Confirm update"}
           </button>
         </div>
       </div>

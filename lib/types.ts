@@ -422,6 +422,9 @@ export type CorrectionEmployee = {
   cognitoTarget: CognitoUserInfo | null;
   /** All Cognito users found for the corp mobile (context / ambiguity). */
   cognitoByMobileCount: number;
+  /** Owners of stored cognito_id(s) that differ from the resolved target —
+   * looked up by sub so a stale or foreign cognito_id is identified. */
+  storedSubOwners: CorrectionStoredSubOwner[];
   fields: CorrectionField[];
   actions: {
     /** Missing in auth → offer the event replay. */
@@ -438,6 +441,9 @@ export type CorrectionEmployee = {
     cognitoAttributeDrift: boolean;
     /** The live sub is also stored on other records → offer to NULL it there. */
     releaseDuplicateCognitoId: boolean;
+    /** No rightful Cognito user + the stored cognito_id is stale or belongs
+     * to a different user → offer to NULL it on this employee's records. */
+    clearWrongCognitoId: boolean;
   };
   /** Conditions that prevent automatic correction (need manual attention). */
   blockers: string[];
@@ -481,6 +487,29 @@ export type CorrectionFixResult = {
   sub: string;
   corp: { empmasterId: string; before: string | null; needsUpdate: boolean; updated: boolean };
   auth: { id: string; before: string | null; needsUpdate: boolean; updated: boolean };
+  preview: boolean;
+};
+
+/** The Cognito owner (or absence) of a cognito_id stored on this employee. */
+export type CorrectionStoredSubOwner = {
+  sub: string;
+  /** Which of this employee's records store it. */
+  sources: ("corp" | "auth")[];
+  /** The Cognito user owning the sub, or null when not found (stale). */
+  user: CognitoUserInfo | null;
+  /** True when stale or owned by a different user — i.e. clearable. */
+  wrong: boolean;
+  /** Non-fatal lookup error (wrong is false when uncertain). */
+  error?: string;
+};
+
+export type CorrectionClearResult = {
+  ok: boolean;
+  message: string;
+  /** The sides that would be / were cleared, with the stored sub and reason. */
+  targets: { source: "corp" | "auth"; id: string; sub: string; reason: string }[];
+  /** Rows actually cleared (0 in preview). */
+  cleared: number;
   preview: boolean;
 };
 
