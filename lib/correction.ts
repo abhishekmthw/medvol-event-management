@@ -196,6 +196,91 @@ async function resolveCognito(
   }
 }
 
+/* --------------------- cognito_id duplicate guard --------------------- */
+
+/** Another corp/auth record already holding a cognito_id we'd write. */
+type CognitoIdConflict = {
+  source: "corp" | "auth";
+  id: string;
+  shortCode: string | null;
+  companyCode: string | null;
+  name: string | null;
+};
+
+/**
+ * Rows OTHER than the employee being corrected that already store the given
+ * sub as their cognito_id — in corp `empmaster_hdr` and auth
+ * `Field_Force_Users`. A cognito_id must identify exactly one record per
+ * table; writing a sub that exists elsewhere would create a duplicate (this
+ * happened once in production), so any hit blocks the fix.
+ */
+async function findCognitoIdConflicts(
+  environment: Environment,
+  sub: string,
+  excludeCorpId: string,
+  excludeAuthId: string | null,
+): Promise<CognitoIdConflict[]> {
+  const corpPool = getPool({ environment, service: "corp", instance: null });
+  const authPool = getAuthPool(environment);
+  const schema = authSchema(environment);
+
+  const corpParams: unknown[] = [sub, excludeCorpId];
+  const authParams: unknown[] = [sub];
+  if (excludeAuthId) authParams.push(excludeAuthId);
+
+  const [corpRes, authRes] = await Promise.all([
+    corpPool.query(
+      `SELECT empmaster_id::text AS id, emp_shortcode AS short_code,
+              company_code::text AS company_code, emp_name AS name
+       FROM public.empmaster_hdr
+       WHERE cognito_id = $1 AND empmaster_id <> $2::integer
+       ORDER BY empmaster_id`,
+      corpParams,
+    ),
+    authPool.query(
+      `SELECT id::text AS id, short_code, company_code::text AS company_code, name
+       FROM "${schema}"."Field_Force_Users"
+       WHERE cognito_id = $1${excludeAuthId ? " AND id <> $2::integer" : ""}
+       ORDER BY id`,
+      authParams,
+    ),
+  ]);
+
+  return [
+    ...corpRes.rows.map(
+      (r): CognitoIdConflict => ({
+        source: "corp",
+        id: r.id,
+        shortCode: r.short_code,
+        companyCode: r.company_code,
+        name: r.name,
+      }),
+    ),
+    ...authRes.rows.map(
+      (r): CognitoIdConflict => ({
+        source: "auth",
+        id: r.id,
+        shortCode: r.short_code,
+        companyCode: r.company_code,
+        name: r.name,
+      }),
+    ),
+  ];
+}
+
+function describeConflicts(conflicts: CognitoIdConflict[]): string {
+  return conflicts
+    .map((c) => {
+      const bits = [
+        norm(c.shortCode) || "—",
+        c.companyCode ? `company ${norm(c.companyCode)}` : null,
+        norm(c.name) || null,
+      ].filter(Boolean);
+      return `${c.source === "corp" ? "corp empmaster" : "auth record"} ${c.id} (${bits.join(", ")})`;
+    })
+    .join("; ");
+}
+
 /* ------------------------- auth-sync drift ------------------------- */
 
 /**
@@ -473,6 +558,31 @@ export async function analyzeByMobile(
     return buildEmployee(corp, matches, resolution);
   });
 
+  // Duplicate guard: the resolved live sub must not be stored on any OTHER
+  // corp/auth record. Surfaced here so the operator sees the conflict before
+  // ever reaching the fix button (which is disabled with the reason).
+  for (const emp of employees) {
+    const sub = norm(emp.cognitoTarget?.sub);
+    if (!sub) continue;
+    const conflicts = await findCognitoIdConflicts(
+      environment,
+      sub,
+      emp.empmasterId,
+      emp.authId,
+    );
+    if (conflicts.length > 0) {
+      emp.blockers.push(
+        `Cognito sub is also stored on: ${describeConflicts(conflicts)} — a cognito_id must identify exactly one record`,
+      );
+      if (emp.actions.fixCognitoId) {
+        emp.actions.fixCognitoId = false;
+        emp.actions.fixCognitoIdBlockedReason =
+          "The live sub is already stored on another record — resolve the duplicate first";
+      }
+      emp.consistent = false;
+    }
+  }
+
   const needFix = employees.filter((e) => !e.consistent).length;
   return {
     ok: true,
@@ -674,6 +784,21 @@ export async function fixCognitoId(
     return fail(cog.blocker ?? "No Cognito user could be resolved for this employee.");
   }
   const sub = norm(cog.target.sub);
+
+  // Duplicate guard (hard, on preview AND run): never write a sub that any
+  // OTHER corp/auth record already stores — a cognito_id must identify
+  // exactly one record per table.
+  const conflicts = await findCognitoIdConflicts(
+    environment,
+    sub,
+    corp.empmaster_id,
+    auth.id,
+  );
+  if (conflicts.length > 0) {
+    return fail(
+      `Refusing to write cognito_id ${sub}: it is already stored on ${describeConflicts(conflicts)}. Resolve those records first.`,
+    );
+  }
 
   const corpNeeds = norm(corp.cognito_id) !== sub;
   const authNeeds = norm(auth.cognito_id) !== sub;
