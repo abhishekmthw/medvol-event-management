@@ -5,9 +5,10 @@ import type { EmployeeCognitoRow } from "@/lib/types";
 
 /**
  * Results table for the Employee ↔ Cognito Check card. One row per mismatched
- * auth employee; mobile and short code stack the auth / cognito values, and
- * fields that disagree are tinted red. The Cognito user is the one matched by
- * the stored cognito_id (sub).
+ * auth employee; each field stacks the auth / cognito / corp values (the auth
+ * record is the scan base; the Cognito user is matched by the stored
+ * cognito_id, the corp record by the (short code, company code) pair), and
+ * fields that disagree are tinted red.
  */
 export function EmployeeCognitoTable({ rows }: { rows: EmployeeCognitoRow[] }) {
   if (rows.length === 0) {
@@ -23,10 +24,10 @@ export function EmployeeCognitoTable({ rows }: { rows: EmployeeCognitoRow[] }) {
         <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
           <tr>
             <Th>Company</Th>
-            <Th>Name (auth)</Th>
             <Th>Short code</Th>
+            <Th>Name</Th>
             <Th>Mobile</Th>
-            <Th>Cognito ID (auth)</Th>
+            <Th>Cognito ID</Th>
             <Th>Cognito user</Th>
             <Th>Status</Th>
           </tr>
@@ -40,29 +41,45 @@ export function EmployeeCognitoTable({ rows }: { rows: EmployeeCognitoRow[] }) {
               <Td className="font-mono whitespace-nowrap">
                 {r.auth.company_code || "—"}
               </Td>
-              <Td>{r.auth.name || "—"}</Td>
 
-              {/* Short code: auth vs cognito custom:emp_short_code */}
+              {/* Short code: auth vs cognito custom:emp_short_code vs corp key */}
               <Td>
                 <Stack mismatch={r.flags.shortCodeMismatch}>
                   <Line label="auth" value={r.auth.short_code} mono />
                   <CognitoLine row={r} value={r.cognito?.emp_short_code} mono />
+                  <CorpLine row={r} value={r.corp?.emp_shortcode} mono />
                 </Stack>
               </Td>
 
-              {/* Mobile: auth vs cognito phone_number */}
+              {/* Name: auth vs cognito vs corp */}
               <Td>
-                <Stack mismatch={r.flags.mobileMismatch}>
+                <Stack mismatch={r.flags.corpNameMismatch}>
+                  <Line label="auth" value={r.auth.name} />
+                  <CognitoLine row={r} value={r.cognito?.name} />
+                  <CorpLine row={r} value={r.corp?.emp_name} />
+                </Stack>
+              </Td>
+
+              {/* Mobile: auth vs cognito phone_number vs corp */}
+              <Td>
+                <Stack
+                  mismatch={r.flags.mobileMismatch || r.flags.corpMobileMismatch}
+                >
                   <Line label="auth" value={r.auth.mobile_no} mono />
                   <CognitoLine row={r} value={r.cognito?.phone_number} mono />
+                  <CorpLine row={r} value={r.corp?.mobile_no} mono />
                 </Stack>
               </Td>
 
+              {/* Cognito ID: auth (the looked-up sub) vs corp's stored copy */}
               <Td>
-                <Stack mismatch={r.flags.notFoundInCognito}>
-                  <span className="font-mono break-all">
-                    {r.auth.cognito_id || "—"}
-                  </span>
+                <Stack
+                  mismatch={
+                    r.flags.notFoundInCognito || r.flags.corpCognitoIdMismatch
+                  }
+                >
+                  <Line label="auth" value={r.auth.cognito_id} mono />
+                  <CorpLine row={r} value={r.corp?.cognito_id} mono />
                 </Stack>
               </Td>
 
@@ -125,6 +142,25 @@ function Stack({
   );
 }
 
+function LabeledValue({
+  label,
+  children,
+  mono,
+}: {
+  label: string;
+  children: React.ReactNode;
+  mono?: boolean;
+}) {
+  return (
+    <div className="flex items-baseline gap-1.5 leading-tight">
+      <span className="text-[10px] uppercase tracking-wide text-[hsl(var(--muted-foreground))] w-9 shrink-0">
+        {label}
+      </span>
+      <span className={clsx(mono && "font-mono", "break-all")}>{children}</span>
+    </div>
+  );
+}
+
 function Line({
   label,
   value,
@@ -135,18 +171,13 @@ function Line({
   mono?: boolean;
 }) {
   return (
-    <div className="flex items-baseline gap-1.5 leading-tight">
-      <span className="text-[10px] uppercase tracking-wide text-[hsl(var(--muted-foreground))] w-9 shrink-0">
-        {label}
-      </span>
-      <span className={clsx(mono && "font-mono", "break-all")}>
-        {value && value.trim() ? (
-          value
-        ) : (
-          <span className="text-[hsl(var(--muted-foreground))]">—</span>
-        )}
-      </span>
-    </div>
+    <LabeledValue label={label} mono={mono}>
+      {value && value.trim() ? (
+        value
+      ) : (
+        <span className="text-[hsl(var(--muted-foreground))]">—</span>
+      )}
+    </LabeledValue>
   );
 }
 
@@ -175,12 +206,38 @@ function CognitoLine({
     content = <span className="text-[hsl(var(--muted-foreground))]">—</span>;
   }
   return (
-    <div className="flex items-baseline gap-1.5 leading-tight">
-      <span className="text-[10px] uppercase tracking-wide text-[hsl(var(--muted-foreground))] w-9 shrink-0">
-        cog
+    <LabeledValue label="cog" mono={mono}>
+      {content}
+    </LabeledValue>
+  );
+}
+
+/** The corp line — shows the corp value, or that no corp record matched. */
+function CorpLine({
+  row,
+  value,
+  mono,
+}: {
+  row: EmployeeCognitoRow;
+  value: string | null | undefined;
+  mono?: boolean;
+}) {
+  let content: React.ReactNode;
+  if (row.corp === null) {
+    content = (
+      <span className="text-[hsl(var(--muted-foreground))] italic">
+        not found
       </span>
-      <span className={clsx(mono && "font-mono", "break-all")}>{content}</span>
-    </div>
+    );
+  } else if (value && value.trim()) {
+    content = value;
+  } else {
+    content = <span className="text-[hsl(var(--muted-foreground))]">—</span>;
+  }
+  return (
+    <LabeledValue label="corp" mono={mono}>
+      {content}
+    </LabeledValue>
   );
 }
 

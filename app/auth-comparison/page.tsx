@@ -409,8 +409,10 @@ export default function AuthComparisonPage() {
             <code>cognito_id</code>, looks that id up in AWS Cognito, and compares
             the <b>mobile number</b> and <b>short code</b> between the auth record
             and the Cognito user (<code>phone_number</code> /{" "}
-            <code>custom:emp_short_code</code>). Runs in chunks of 200 — only
-            mismatches are listed.
+            <code>custom:emp_short_code</code>). Each employee is then also matched
+            to corp (<code>empmaster_hdr</code>, by short code + company code) and
+            its <b>name</b>, <b>mobile</b> and <b>cognito id</b> are compared
+            against corp too. Runs in chunks of 200 — only mismatches are listed.
           </p>
 
           {scanError && (
@@ -501,9 +503,10 @@ export default function AuthComparisonPage() {
             <p className="text-sm text-[hsl(var(--muted-foreground))]">
               Checked {scanMeta.checked} of {scanMeta.totalWithCognitoId}{" "}
               {scope === "active" ? "active " : ""}employees with a cognito_id
-              ({scanMeta.totalEmployees} in scope overall) against Cognito —{" "}
-              {scanRows.length} with a mobile / short-code mismatch, a stale
-              cognito_id, or a lookup error.
+              ({scanMeta.totalEmployees} in scope overall) against Cognito and
+              corp — {scanRows.length} with a mismatch (mobile / short code vs
+              Cognito, name / mobile / cognito_id vs corp, a stale cognito_id,
+              missing in corp, or a lookup error).
             </p>
 
             {!scanMeta.done && (

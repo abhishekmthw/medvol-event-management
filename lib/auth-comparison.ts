@@ -437,11 +437,45 @@ async function fetchAuthEmployeeChunk(
   };
 }
 
+/**
+ * Corp records for the chunk's short codes, keyed by (short code, company code)
+ * — the same pair identity the corp-driven comparison uses. No active filter:
+ * the auth scope drives the scan; the corp record is looked up regardless.
+ */
+async function fetchCorpForShortCodes(
+  environment: Environment,
+  shortCodes: string[],
+): Promise<Map<string, CorpEmployeeRow[]>> {
+  const byKey = new Map<string, CorpEmployeeRow[]>();
+  if (shortCodes.length === 0) return byKey;
+  const pool = getPool({ environment, service: "corp", instance: null });
+  const sql = `
+    SELECT
+      empmaster_id::text AS empmaster_id,
+      emp_shortcode,
+      company_code::text AS company_code,
+      emp_name,
+      mobile_no::text AS mobile_no,
+      cognito_id,
+      active_status
+    FROM public.empmaster_hdr
+    WHERE emp_shortcode = ANY($1::text[])
+    ORDER BY empmaster_id`;
+  const { rows } = await pool.query(sql, [shortCodes]);
+  for (const r of rows as CorpEmployeeRow[]) {
+    const k = pairKey(r.emp_shortcode, r.company_code);
+    (byKey.get(k) ?? byKey.set(k, []).get(k)!).push(r);
+  }
+  return byKey;
+}
+
 function buildEmployeeCognitoRow(
   auth: AuthEmployeeRow,
   lookup: { users: CognitoUserInfo[]; error?: string },
+  corpMatches: CorpEmployeeRow[],
 ): EmployeeCognitoRow {
   const cognito = lookup.users[0] ?? null;
+  const corp = corpMatches[0] ?? null;
   const flags = {
     notFoundInCognito: !lookup.error && cognito === null,
     mobileMismatch:
@@ -451,6 +485,15 @@ function buildEmployeeCognitoRow(
       cognito !== null &&
       norm(auth.short_code).toUpperCase() !==
         norm(cognito.emp_short_code).toUpperCase(),
+    missingInCorp: corp === null,
+    corpNameMismatch:
+      corp !== null &&
+      norm(auth.name).toLowerCase() !== norm(corp.emp_name).toLowerCase(),
+    corpMobileMismatch:
+      corp !== null &&
+      normalizeMobile(auth.mobile_no) !== normalizeMobile(corp.mobile_no),
+    corpCognitoIdMismatch:
+      corp !== null && norm(auth.cognito_id) !== norm(corp.cognito_id),
   };
 
   const statuses: string[] = [];
@@ -458,11 +501,18 @@ function buildEmployeeCognitoRow(
   if (flags.notFoundInCognito) statuses.push("cognito_id not found in Cognito");
   if (flags.mobileMismatch) statuses.push("Mobile ≠ Cognito");
   if (flags.shortCodeMismatch) statuses.push("Short code ≠ Cognito");
+  if (flags.missingInCorp) statuses.push("Missing in corp");
+  if (flags.corpNameMismatch) statuses.push("Name ≠ corp");
+  if (flags.corpMobileMismatch) statuses.push("Mobile ≠ corp");
+  if (flags.corpCognitoIdMismatch) statuses.push("cognito_id ≠ corp");
+  if (corpMatches.length > 1) statuses.push("Multiple corp matches");
 
   return {
     key: auth.id,
     auth,
     cognito,
+    corp,
+    corpMatchCount: corpMatches.length,
     error: lookup.error,
     flags,
     statuses,
@@ -480,27 +530,37 @@ export async function checkEmployeesAgainstCognito(
 
   // One Cognito lookup per DISTINCT sub (two auth rows can share a cognito_id),
   // in bounded-concurrency batches. A per-sub failure is captured on the rows
-  // that reference it, never thrown.
+  // that reference it, never thrown. The corp lookup for the chunk's short
+  // codes runs concurrently — it's a single DB query on a separate pool.
   const subs = Array.from(new Set(rows.map((r) => norm(r.cognito_id))));
   const lookups = new Map<string, { users: CognitoUserInfo[]; error?: string }>();
-  for (let i = 0; i < subs.length; i += COGNITO_CONCURRENCY) {
-    const batch = subs.slice(i, i + COGNITO_CONCURRENCY);
-    await Promise.all(
-      batch.map(async (sub) => {
-        try {
-          lookups.set(sub, { users: await lookupBySub(environment, sub) });
-        } catch (e) {
-          lookups.set(sub, { users: [], error: describeCognitoError(e) });
-        }
-      }),
-    );
-  }
+  const shortCodes = Array.from(
+    new Set(rows.map((r) => norm(r.short_code)).filter(Boolean)),
+  );
+  const [corpByKey] = await Promise.all([
+    fetchCorpForShortCodes(environment, shortCodes),
+    (async () => {
+      for (let i = 0; i < subs.length; i += COGNITO_CONCURRENCY) {
+        const batch = subs.slice(i, i + COGNITO_CONCURRENCY);
+        await Promise.all(
+          batch.map(async (sub) => {
+            try {
+              lookups.set(sub, { users: await lookupBySub(environment, sub) });
+            } catch (e) {
+              lookups.set(sub, { users: [], error: describeCognitoError(e) });
+            }
+          }),
+        );
+      }
+    })(),
+  ]);
 
   const mismatched = rows
     .map((auth) =>
       buildEmployeeCognitoRow(
         auth,
         lookups.get(norm(auth.cognito_id)) ?? { users: [] },
+        corpByKey.get(pairKey(auth.short_code, auth.company_code)) ?? [],
       ),
     )
     .filter((r) => r.statuses.length > 0);

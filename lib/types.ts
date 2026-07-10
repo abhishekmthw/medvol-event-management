@@ -343,7 +343,7 @@ export type AuthComparisonResult = {
  * table without hitting serverless timeouts.
  * ------------------------------------------------------------------ */
 
-/** Disagreement flags for one auth employee vs its live Cognito user. */
+/** Disagreement flags for one auth employee vs Cognito and corp. */
 export type EmployeeCognitoFlags = {
   /** The stored cognito_id matched no Cognito user (stale sub). */
   notFoundInCognito: boolean;
@@ -351,15 +351,27 @@ export type EmployeeCognitoFlags = {
   mobileMismatch: boolean;
   /** auth.short_code differs from Cognito custom:emp_short_code. */
   shortCodeMismatch: boolean;
+  /** No corp empmaster_hdr record for the auth (short code, company code). */
+  missingInCorp: boolean;
+  /** auth.name differs from corp.emp_name. */
+  corpNameMismatch: boolean;
+  /** auth.mobile_no differs from corp.mobile_no. */
+  corpMobileMismatch: boolean;
+  /** auth.cognito_id differs from corp.cognito_id. */
+  corpCognitoIdMismatch: boolean;
 };
 
-/** One auth employee checked against Cognito (only mismatches are returned). */
+/** One auth employee checked against Cognito + corp (only mismatches are returned). */
 export type EmployeeCognitoRow = {
   /** Unique row key (auth Field_Force_Users.id). */
   key: string;
   auth: AuthEmployeeRow;
   /** The Cognito user matched by sub, or null when not found / lookup failed. */
   cognito: CognitoUserInfo | null;
+  /** The corp record matched by (short code, company code), or null when missing. */
+  corp: CorpEmployeeRow | null;
+  /** Corp records matching the pair (>1 = duplicate short code in corp). */
+  corpMatchCount: number;
   /** Non-fatal Cognito error for this record (lookup skipped comparison). */
   error?: string;
   flags: EmployeeCognitoFlags;
