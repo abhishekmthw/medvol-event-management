@@ -1,11 +1,13 @@
+import { randomUUID } from "crypto";
 import {
   ChangeMessageVisibilityCommand,
   DeleteMessageCommand,
+  SendMessageCommand,
   SQSClient,
   SQSServiceException,
 } from "@aws-sdk/client-sqs";
 import { getInstance } from "./instances";
-import type { Target } from "./types";
+import type { Environment, Target } from "./types";
 
 /**
  * Outcome of an SQS call.
@@ -177,4 +179,69 @@ export function refireSqsMessage(
   target: Target,
 ): Promise<SqsOutcome> {
   return callSqs("changeVisibility", receiptHandle, target);
+}
+
+/* --------------------- V1 auth consumer queue send --------------------- */
+
+/**
+ * Config for the V1 auth-backend consumer FIFO queue (event replay for the
+ * Employee Data Correction card). The queue lives in the same per-env AWS
+ * account as the shared Corp/OMS queues, so credentials/region are reused
+ * from `{ENV}_AWS_*` — only the queue URL is new (`AUTH_{ENV}_SQS_QUEUE_URL`).
+ * The `{ENV}_AWS_*` IAM credentials additionally need `sqs:SendMessage` on it.
+ */
+function resolveAuthQueueConfig(environment: Environment): SqsConfig {
+  const envUpper = environment.toUpperCase();
+  return {
+    queueUrl: requireEnv(`AUTH_${envUpper}_SQS_QUEUE_URL`),
+    region: readEnv(`${envUpper}_AWS_REGION`) ?? DEFAULT_REGION,
+    credentials: {
+      accessKeyId: requireEnv(`${envUpper}_AWS_ACCESS_KEY_ID`),
+      secretAccessKey: requireEnv(`${envUpper}_AWS_SECRET_ACCESS_KEY`),
+    },
+    // Same account/creds as the shared queues — reuse the cached client.
+    cacheKey: `shared:${environment}`,
+  };
+}
+
+/**
+ * Send one message to the V1 auth consumer FIFO queue. `body` is the
+ * JSON-serialized corp `public.events` row (the auth-backend consumer accepts
+ * raw event rows: it only unwraps `body.Message` when `event_type` is absent,
+ * and events rows carry no `signature` column, so verification is skipped).
+ * `groupId` should be the event stream id — mirrors the SDK's SNS publishing
+ * (`MessageGroupId = streamId`) so replayed events stay FIFO-ordered.
+ */
+export async function sendAuthQueueMessage(
+  environment: Environment,
+  body: string,
+  groupId: string,
+): Promise<SqsOutcome> {
+  const cfg = resolveAuthQueueConfig(environment);
+  const client = getClient(cfg);
+  try {
+    await client.send(
+      new SendMessageCommand({
+        QueueUrl: cfg.queueUrl,
+        MessageBody: body,
+        MessageGroupId: groupId,
+        MessageDeduplicationId: randomUUID().replace(/-/g, ""),
+      }),
+    );
+    return { kind: "success" };
+  } catch (err) {
+    const name = err instanceof Error ? err.name : "Error";
+    const msg = err instanceof Error ? err.message : String(err);
+    const lines = [
+      `SQS send failed (${name}): ${msg}`,
+      `  queueUrl=${cfg.queueUrl}`,
+      `  region=${cfg.region}`,
+    ];
+    if (err instanceof SQSServiceException) {
+      const meta = err.$metadata;
+      if (meta?.httpStatusCode != null) lines.push(`  httpStatus=${meta.httpStatusCode}`);
+      if (meta?.requestId) lines.push(`  requestId=${meta.requestId}`);
+    }
+    return { kind: "error", reason: lines.join("\n") };
+  }
 }

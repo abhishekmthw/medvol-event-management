@@ -53,12 +53,15 @@ export function normalizeMobile(v: string | null | undefined): string | null {
   return digits.length > 10 ? digits.slice(-10) : digits;
 }
 
-function norm(v: string | null | undefined): string {
+export function norm(v: string | null | undefined): string {
   return (v ?? "").trim();
 }
 
 /** Composite identity key — a short code is only unique within a company. */
-function pairKey(shortCode: string | null, companyCode: string | null): string {
+export function pairKey(
+  shortCode: string | null,
+  companyCode: string | null,
+): string {
   return `${norm(shortCode)}${KEY_SEP}${norm(companyCode)}`;
 }
 

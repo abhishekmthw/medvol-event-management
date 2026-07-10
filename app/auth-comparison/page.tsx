@@ -17,6 +17,7 @@ import {
 import { AppHeader } from "@/components/app-header";
 import { Segmented } from "@/components/segmented";
 import { AuthComparisonTable } from "@/components/auth-comparison-table";
+import { DataCorrectionCard } from "@/components/data-correction-card";
 import { EmployeeCognitoTable } from "@/components/employee-cognito-table";
 import { toComparisonCsv, toEmployeeCognitoCsv } from "@/lib/comparison-csv";
 import {
@@ -521,6 +522,13 @@ export default function AuthComparisonPage() {
             <EmployeeCognitoTable rows={scanRows} />
           </section>
         )}
+
+        {/* Employee data correction (corp-driven, mobile-keyed) */}
+        <DataCorrectionCard
+          key={environment}
+          environment={environment}
+          onSessionExpired={handleSessionExpired}
+        />
       </div>
     </main>
   );

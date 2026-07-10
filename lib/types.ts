@@ -262,6 +262,8 @@ export type CognitoUserInfo = {
   phone_number: string | null;
   /** `custom:emp_short_code` — the field-force short code stored on the Cognito user. */
   emp_short_code: string | null;
+  /** `custom:ucode` — the user's ucode stored on the Cognito user. */
+  ucode: string | null;
   username: string | null;
   status: string | null;
   enabled: boolean | null;
@@ -377,6 +379,101 @@ export type EmployeeCognitoRow = {
   flags: EmployeeCognitoFlags;
   /** Human-readable status chips (e.g. "Mobile ≠ Cognito"). */
   statuses: string[];
+};
+
+/* ------------------------------------------------------------------ *
+ * Employee Data Correction — corp-driven, mobile-keyed. Corp
+ * (empmaster_hdr) is the source of truth for short code / mobile /
+ * name / ucode; Cognito is the source of truth for cognito_id. Two
+ * corrective actions, both preview-then-confirm:
+ *   1. Missing in auth → replay the employee_<empmaster_id> stream
+ *      events from corp public.events onto the V1 auth SQS FIFO queue
+ *      (the auth-backend consumer re-creates the user).
+ *   2. Fix cognito_id → resolve the live Cognito user by corp mobile
+ *      (guarded by custom:emp_short_code = corp short code) and write
+ *      its sub into corp.empmaster_hdr and auth.Field_Force_Users.
+ * ------------------------------------------------------------------ */
+
+/** One compared field with its per-source values + deviation flags. */
+export type CorrectionField = {
+  key: string;
+  label: string;
+  /** mismatch = corp deviates from THIS FIELD's source of truth (only ever
+   * true for cognito_id, where Cognito is the truth). */
+  corp: { value: string | null; mismatch: boolean };
+  auth: { value: string | null; present: boolean; mismatch: boolean };
+  cognito: { value: string | null; present: boolean; mismatch: boolean };
+};
+
+/** One corp employee analyzed for correction. */
+export type CorrectionEmployee = {
+  empmasterId: string;
+  /** The event stream that would be replayed to create the user in auth. */
+  streamId: string;
+  shortCode: string;
+  companyCode: string;
+  activeStatus: string | null;
+  presentInAuth: boolean;
+  /** Auth Field_Force_Users.id of the matched record (null when missing). */
+  authId: string | null;
+  /** Auth records matching (short code, company code) — >1 blocks fixes. */
+  authMatchCount: number;
+  /** The live Cognito user resolved by corp mobile + matching short code. */
+  cognitoTarget: CognitoUserInfo | null;
+  /** All Cognito users found for the corp mobile (context / ambiguity). */
+  cognitoByMobileCount: number;
+  fields: CorrectionField[];
+  actions: {
+    /** Missing in auth → offer the event replay. */
+    createInAuth: boolean;
+    /** A resolved Cognito sub differs from corp/auth cognito_id → offer fix. */
+    fixCognitoId: boolean;
+    /** Why the cognito_id fix is currently blocked (when it IS needed). */
+    fixCognitoIdBlockedReason?: string;
+  };
+  /** Conditions that prevent automatic correction (need manual attention). */
+  blockers: string[];
+  statuses: string[];
+  consistent: boolean;
+  /** Non-fatal Cognito lookup error for this employee. */
+  cognitoError?: string;
+};
+
+export type CorrectionAnalyzeResult = {
+  ok: boolean;
+  message: string;
+  environment: Environment;
+  mobile10: string;
+  employees: CorrectionEmployee[];
+};
+
+/** Summary of one corp event row (for the replay preview list). */
+export type CorrectionEventSummary = {
+  eventId: string;
+  event_type: string;
+  timestamp: string | null;
+};
+
+export type CorrectionReplayResult = {
+  ok: boolean;
+  message: string;
+  streamId: string;
+  totalEvents: number;
+  events: CorrectionEventSummary[];
+  /** Messages actually sent to the auth queue (0 in preview). */
+  sent: number;
+  errors: { eventId: string; reason: string }[];
+  preview: boolean;
+};
+
+export type CorrectionFixResult = {
+  ok: boolean;
+  message: string;
+  /** The live Cognito sub being written. */
+  sub: string;
+  corp: { empmasterId: string; before: string | null; needsUpdate: boolean; updated: boolean };
+  auth: { id: string; before: string | null; needsUpdate: boolean; updated: boolean };
+  preview: boolean;
 };
 
 /** One chunk of the employee ↔ Cognito scan. */
