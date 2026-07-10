@@ -1,5 +1,6 @@
 import { authSchema, getAuthPool, getPool } from "./db";
 import { describeCognitoError, lookupByMobile, lookupBySub } from "./cognito";
+import { normalizeName } from "./format";
 import type {
   AuthComparisonResult,
   AuthComparisonRow,
@@ -166,9 +167,10 @@ function buildComparison(pair: Pair): AuthComparisonRow {
   const { corp, auth, authMatchCount } = pair;
   const presentInAuth = auth !== null;
 
+  // Names match on their canonical form (lowercase, special characters
+  // stripped) so encoding damage like a trailing "�" doesn't flag a diff.
   const nameMismatch =
-    presentInAuth &&
-    norm(auth!.name).toLowerCase() !== norm(corp.emp_name).toLowerCase();
+    presentInAuth && normalizeName(auth!.name) !== normalizeName(corp.emp_name);
   const mobileMismatch =
     presentInAuth &&
     normalizeMobile(auth!.mobile_no) !== normalizeMobile(corp.mobile_no);
@@ -490,8 +492,7 @@ function buildEmployeeCognitoRow(
         norm(cognito.emp_short_code).toUpperCase(),
     missingInCorp: corp === null,
     corpNameMismatch:
-      corp !== null &&
-      norm(auth.name).toLowerCase() !== norm(corp.emp_name).toLowerCase(),
+      corp !== null && normalizeName(auth.name) !== normalizeName(corp.emp_name),
     corpMobileMismatch:
       corp !== null &&
       normalizeMobile(auth.mobile_no) !== normalizeMobile(corp.mobile_no),

@@ -1,3 +1,4 @@
+import { displayMobile10 } from "./format";
 import type {
   AuthComparisonResult,
   AuthComparisonRow,
@@ -10,7 +11,8 @@ import type {
  * base + source of truth (its value comes first per field); auth and the live
  * Cognito user are compared against it. Columns: identity, presence, then each
  * field with corp/auth/cognito values + the deviation flags, then status notes.
- * Type-only imports keep this module safe to use from the client bundle.
+ * Only type imports and the pure `lib/format` helpers are used, so this module
+ * stays safe to bundle for the client.
  */
 
 const HEADERS = [
@@ -75,7 +77,7 @@ function rowCells(r: AuthComparisonRow): string[] {
     yn(r.flags.nameMismatch),
     r.corp?.mobile_no ?? "",
     r.auth?.mobile_no ?? "",
-    live ? joinCognito(c.byMobile, (u) => u.phone_number) : "",
+    live ? joinCognito(c.byMobile, (u) => displayMobile10(u.phone_number)) : "",
     yn(r.flags.mobileMismatch),
     r.corp?.cognito_id ?? "",
     r.auth?.cognito_id ?? "",
@@ -142,7 +144,7 @@ function empCognitoRowCells(r: EmployeeCognitoRow): string[] {
     r.corp?.emp_name ?? "",
     yn(r.flags.corpNameMismatch),
     r.auth.mobile_no ?? "",
-    r.cognito?.phone_number ?? "",
+    displayMobile10(r.cognito?.phone_number) ?? "",
     r.corp?.mobile_no ?? "",
     yn(r.flags.mobileMismatch),
     yn(r.flags.corpMobileMismatch),

@@ -1,6 +1,7 @@
 import { authSchema, getAuthPool, getPool } from "./db";
 import { describeCognitoError, lookupByMobile } from "./cognito";
 import { norm, normalizeMobile, pairKey } from "./auth-comparison";
+import { displayMobile10, normalizeName } from "./format";
 import { sendAuthQueueMessage } from "./sqs";
 import type {
   CognitoUserInfo,
@@ -10,6 +11,8 @@ import type {
   CorrectionField,
   CorrectionFixResult,
   CorrectionReplayResult,
+  CorrectionSyncChange,
+  CorrectionSyncResult,
   Environment,
 } from "./types";
 
@@ -40,7 +43,7 @@ import type {
 
 /* ------------------------------- fetch ------------------------------- */
 
-/** Corp employee row for the correction card (superset incl. u_code). */
+/** Corp employee row for the correction card (superset incl. ucode). */
 type CorpRow = {
   empmaster_id: string;
   emp_shortcode: string | null;
@@ -48,7 +51,8 @@ type CorpRow = {
   emp_name: string | null;
   mobile_no: string | null;
   cognito_id: string | null;
-  u_code: string | null;
+  /** Corp's ucode lives in the `uid` column (NOT `u_code`). */
+  ucode: string | null;
   active_status: string | null;
 };
 
@@ -72,7 +76,7 @@ const CORP_SELECT = `
     emp_name,
     mobile_no::text AS mobile_no,
     cognito_id,
-    u_code,
+    uid::text AS ucode,
     active_status
   FROM public.empmaster_hdr`;
 
@@ -192,6 +196,45 @@ async function resolveCognito(
   }
 }
 
+/* ------------------------- auth-sync drift ------------------------- */
+
+/**
+ * Auth columns that drifted from corp (corp = truth) and what the sync would
+ * write. Shared by analyze (to decide whether to offer the action) and by
+ * `syncAuthFromCorp` (to apply it) so the two can never disagree. Uses the
+ * same tolerant comparisons as the display: canonical names (so an
+ * encoding-damaged corp name is NOT copied over a clean auth one), last-10
+ * mobiles, case-insensitive ucodes.
+ */
+function computeAuthSyncChanges(corp: CorpRow, auth: AuthRow): CorrectionSyncChange[] {
+  const changes: CorrectionSyncChange[] = [];
+  if (normalizeName(auth.name) !== normalizeName(corp.emp_name)) {
+    changes.push({
+      column: "name",
+      label: "Name",
+      before: auth.name,
+      after: norm(corp.emp_name) || null,
+    });
+  }
+  if (normalizeMobile(auth.mobile_no) !== normalizeMobile(corp.mobile_no)) {
+    changes.push({
+      column: "mobile_no",
+      label: "Mobile",
+      before: auth.mobile_no,
+      after: normalizeMobile(corp.mobile_no),
+    });
+  }
+  if (!sameCode(auth.ucode, corp.ucode)) {
+    changes.push({
+      column: "ucode",
+      label: "Ucode",
+      before: auth.ucode,
+      after: norm(corp.ucode).toLowerCase() || null,
+    });
+  }
+  return changes;
+}
+
 /* ------------------------------ analyze ------------------------------ */
 
 function field(
@@ -238,10 +281,19 @@ function buildEmployee(
     mismatch: target !== null && mismatch,
   });
 
+  // Ucodes are shown lowercased for uniformity — Cognito stores them in
+  // uppercase, corp/auth in lowercase; the comparison is case-insensitive.
+  const lcUcode = (v: string | null | undefined): string | null => {
+    const s = norm(v);
+    return s ? s.toLowerCase() : null;
+  };
+
   // Corp is the truth for short code / mobile / name / ucode. The auth record
   // is matched BY (short code, company code), so its short code can only
-  // mismatch by being absent. Cognito is the truth for cognito_id: there the
-  // corp/auth stored values are the ones flagged.
+  // mismatch by being absent. Names compare on their canonical form
+  // (lowercase, special characters stripped) so encoding damage like a
+  // trailing "�" doesn't flag a diff. Cognito is the truth for cognito_id:
+  // there the corp/auth stored values are the ones flagged.
   const fields: CorrectionField[] = [
     field(
       "shortCode",
@@ -254,22 +306,26 @@ function buildEmployee(
       "name",
       "Name",
       corp.emp_name,
-      authVal(auth?.name, norm(auth?.name).toLowerCase() !== norm(corp.emp_name).toLowerCase()),
-      cogVal(target?.name, norm(target?.name).toLowerCase() !== norm(corp.emp_name).toLowerCase()),
+      authVal(auth?.name, normalizeName(auth?.name) !== normalizeName(corp.emp_name)),
+      cogVal(target?.name, normalizeName(target?.name) !== normalizeName(corp.emp_name)),
     ),
     field(
       "mobile",
       "Mobile",
       corp.mobile_no,
       authVal(auth?.mobile_no, normalizeMobile(auth?.mobile_no) !== normalizeMobile(corp.mobile_no)),
-      cogVal(target?.phone_number, normalizeMobile(target?.phone_number) !== normalizeMobile(corp.mobile_no)),
+      cogVal(
+        // Display without the +91 country code Cognito stores.
+        target ? displayMobile10(target.phone_number) : null,
+        normalizeMobile(target?.phone_number) !== normalizeMobile(corp.mobile_no),
+      ),
     ),
     field(
       "ucode",
       "Ucode",
-      corp.u_code,
-      authVal(auth?.ucode, !sameCode(auth?.ucode, corp.u_code)),
-      cogVal(target?.ucode, !sameCode(target?.ucode, corp.u_code)),
+      lcUcode(corp.ucode),
+      authVal(lcUcode(auth?.ucode), !sameCode(auth?.ucode, corp.ucode)),
+      cogVal(lcUcode(target?.ucode), !sameCode(target?.ucode, corp.ucode)),
     ),
     field(
       "cognitoId",
@@ -316,6 +372,20 @@ function buildEmployee(
     statuses.push("Stored cognito_id could not be validated against Cognito");
   }
 
+  // Auth-side drift on an EXISTING record (name / mobile / ucode) is fixed by
+  // a direct sync from corp. Cognito-side name/ucode drift is surfaced but
+  // never auto-corrected — that would mutate login-critical Cognito
+  // attributes, which this tool deliberately doesn't do.
+  const syncChanges = auth ? computeAuthSyncChanges(corp, auth) : [];
+  const syncNeeded = syncChanges.length > 0;
+  const syncBlockedReason =
+    syncNeeded && authMatches.length > 1
+      ? "Multiple auth records match — resolve the duplicate first"
+      : undefined;
+  const cognitoAttributeDrift = fields.some(
+    (f) => (f.key === "name" || f.key === "ucode") && f.cognito.mismatch,
+  );
+
   const consistent =
     presentInAuth && statuses.length === 0 && blockers.length === 0;
 
@@ -335,6 +405,9 @@ function buildEmployee(
       createInAuth: !presentInAuth,
       fixCognitoId: cognitoIdNeedsFix && presentInAuth && authMatches.length <= 1,
       fixCognitoIdBlockedReason: fixBlockedReason,
+      syncAuthFromCorp: syncNeeded && !syncBlockedReason,
+      syncAuthBlockedReason: syncBlockedReason,
+      cognitoAttributeDrift,
     },
     blockers,
     statuses,
@@ -650,4 +723,98 @@ export async function fixCognitoId(
     .join(" + ");
   result.message = `Updated cognito_id to ${sub} in ${did}.`;
   return result;
+}
+
+/* ---------------------- action 3: sync auth from corp ---------------------- */
+
+/** Auth columns the sync may touch — fixed allow-list, never client input. */
+const SYNCABLE_COLUMNS = new Set(["name", "mobile_no", "ucode"]);
+
+/**
+ * Copy corp-truth values (name / mobile / ucode) onto an EXISTING auth record
+ * that drifted. Only the columns that actually differ (per the same tolerant
+ * comparisons the analysis shows) are written, in one parameterized UPDATE.
+ * Everything is re-derived server-side from `empmasterId`; preview reports
+ * the before → after per column without writing.
+ */
+export async function syncAuthFromCorp(
+  environment: Environment,
+  empmasterId: string,
+  preview: boolean,
+): Promise<CorrectionSyncResult> {
+  const fail = (message: string): CorrectionSyncResult => ({
+    ok: false,
+    message,
+    authId: "",
+    changes: [],
+    updated: false,
+    preview,
+  });
+
+  const corp = await fetchCorpById(environment, empmasterId);
+  if (!corp) return fail(`No corp employee with empmaster_id ${empmasterId}.`);
+
+  const authMatches = (
+    await fetchAuthByShortCodes(environment, [norm(corp.emp_shortcode)].filter(Boolean))
+  ).filter(
+    (a) =>
+      pairKey(a.short_code, a.company_code) ===
+      pairKey(corp.emp_shortcode, corp.company_code),
+  );
+  if (authMatches.length === 0) {
+    return fail(
+      "Employee is missing in auth — run “Create in auth” instead; the replay carries the corp values.",
+    );
+  }
+  if (authMatches.length > 1) {
+    return fail(
+      `${authMatches.length} auth records match (short code, company code) — resolve the duplicate before syncing.`,
+    );
+  }
+  const auth = authMatches[0];
+
+  const changes = computeAuthSyncChanges(corp, auth).filter((c) =>
+    SYNCABLE_COLUMNS.has(c.column),
+  );
+  if (changes.length === 0) {
+    return {
+      ok: true,
+      message: "Auth already matches corp on name, mobile and ucode — nothing to sync.",
+      authId: auth.id,
+      changes: [],
+      updated: false,
+      preview,
+    };
+  }
+
+  if (preview) {
+    return {
+      ok: true,
+      message: `Would update ${changes.map((c) => c.label.toLowerCase()).join(", ")} on the auth record from corp.`,
+      authId: auth.id,
+      changes,
+      updated: false,
+      preview: true,
+    };
+  }
+
+  const pool = getAuthPool(environment);
+  const schema = authSchema(environment);
+  // Column names come from the fixed allow-list above; values parameterized.
+  const sets = changes.map((c, i) => `"${c.column}" = $${i + 1}`).join(", ");
+  const params: unknown[] = changes.map((c) => c.after);
+  params.push(auth.id);
+  await pool.query(
+    `UPDATE "${schema}"."Field_Force_Users" SET ${sets} WHERE id = $${params.length}::integer`,
+    params,
+  );
+
+  return {
+    ok: true,
+    message: `Updated ${changes.map((c) => c.label.toLowerCase()).join(", ")} on auth record ${auth.id} from corp.`,
+    authId: auth.id,
+    changes,
+    updated: true,
+    preview: false,
+  };
 }

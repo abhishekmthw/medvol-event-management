@@ -17,6 +17,7 @@ import type {
   CorrectionField,
   CorrectionFixResult,
   CorrectionReplayResult,
+  CorrectionSyncResult,
   Environment,
 } from "@/lib/types";
 
@@ -33,7 +34,7 @@ import type {
  *      short code) into corp and auth.
  */
 
-type ActionKind = "replay" | "fix";
+type ActionKind = "replay" | "fix" | "sync";
 
 type ActionState = {
   kind: ActionKind;
@@ -44,6 +45,8 @@ type ActionState = {
   replayResult?: CorrectionReplayResult;
   fixPreview?: CorrectionFixResult;
   fixResult?: CorrectionFixResult;
+  syncPreview?: CorrectionSyncResult;
+  syncResult?: CorrectionSyncResult;
   error?: string;
 };
 
@@ -258,6 +261,62 @@ export function DataCorrectionCard({
     }
   }
 
+  /* --------------------------- sync auth from corp --------------------------- */
+
+  async function startSync(emp: CorrectionEmployee) {
+    setPollNote(null);
+    setAction({
+      kind: "sync",
+      empmasterId: emp.empmasterId,
+      shortCode: emp.shortCode,
+      phase: "previewing",
+    });
+    try {
+      const preview = await post<CorrectionSyncResult>(
+        "/api/auth-comparison/correction/sync-auth",
+        { environment, empmasterId: emp.empmasterId, preview: true },
+      );
+      if (preview === null) return;
+      if (!preview.ok || preview.changes.length === 0) {
+        setAction((a) => a && { ...a, phase: "done", error: preview.message });
+        return;
+      }
+      setAction((a) => a && { ...a, phase: "confirm", syncPreview: preview });
+    } catch (e) {
+      setAction(
+        (a) =>
+          a && {
+            ...a,
+            phase: "done",
+            error: e instanceof Error ? e.message : String(e),
+          },
+      );
+    }
+  }
+
+  async function confirmSync() {
+    if (!action || action.kind !== "sync") return;
+    setAction({ ...action, phase: "running" });
+    try {
+      const run = await post<CorrectionSyncResult>(
+        "/api/auth-comparison/correction/sync-auth",
+        { environment, empmasterId: action.empmasterId, preview: false },
+      );
+      if (run === null) return;
+      setAction((a) => a && { ...a, phase: "done", syncResult: run });
+      await analyze(true);
+    } catch (e) {
+      setAction(
+        (a) =>
+          a && {
+            ...a,
+            phase: "done",
+            error: e instanceof Error ? e.message : String(e),
+          },
+      );
+    }
+  }
+
   const busy =
     analyzing ||
     polling ||
@@ -290,10 +349,12 @@ export function DataCorrectionCard({
         then compared against auth and Cognito on <b>short code</b>,{" "}
         <b>mobile</b>, <b>name</b> and <b>ucode</b>. If the employee is missing
         in auth, its corp event stream (<code>employee_&lt;empmaster id&gt;</code>)
-        can be replayed onto the auth queue to re-create it; once present, the
-        live Cognito user (matched by corp mobile + short code) supplies the
-        correct <b>cognito_id</b>, which is then written to corp and auth. Every
-        action previews first and asks for confirmation.
+        can be replayed onto the auth queue to re-create it; if it exists but
+        its name / mobile / ucode drifted, they can be synced onto the auth
+        record from corp; and the live Cognito user (matched by corp mobile +
+        short code) supplies the correct <b>cognito_id</b>, which is then
+        written to corp and auth. Every action previews first and asks for
+        confirmation.
       </p>
 
       <div className="space-y-2">
@@ -387,6 +448,7 @@ export function DataCorrectionCard({
               action={action?.empmasterId === emp.empmasterId ? action : null}
               onCreateInAuth={() => startReplay(emp)}
               onFixCognito={() => startFix(emp)}
+              onSyncAuth={() => startSync(emp)}
             />
           ))}
         </div>
@@ -399,7 +461,13 @@ export function DataCorrectionCard({
           isProd={isProd}
           environment={environment}
           onCancel={() => setAction(null)}
-          onConfirm={action.kind === "replay" ? confirmReplay : confirmFix}
+          onConfirm={
+            action.kind === "replay"
+              ? confirmReplay
+              : action.kind === "fix"
+                ? confirmFix
+                : confirmSync
+          }
         />
       )}
     </section>
@@ -415,6 +483,7 @@ function EmployeePanel({
   action,
   onCreateInAuth,
   onFixCognito,
+  onSyncAuth,
 }: {
   emp: CorrectionEmployee;
   isProd: boolean;
@@ -422,6 +491,7 @@ function EmployeePanel({
   action: ActionState | null;
   onCreateInAuth: () => void;
   onFixCognito: () => void;
+  onSyncAuth: () => void;
 }) {
   const working = action?.phase === "previewing" || action?.phase === "running";
   return (
@@ -480,7 +550,8 @@ function EmployeePanel({
             "rounded-lg px-3 py-2 text-xs flex items-start gap-2",
             action.error ||
               (action.kind === "replay" && !action.replayResult?.ok) ||
-              (action.kind === "fix" && !action.fixResult?.ok)
+              (action.kind === "fix" && !action.fixResult?.ok) ||
+              (action.kind === "sync" && !action.syncResult?.ok)
               ? "border border-[hsl(var(--danger))]/40 bg-[hsl(var(--danger))]/10 text-[hsl(var(--danger))]"
               : "border border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400",
           )}
@@ -490,7 +561,9 @@ function EmployeePanel({
             {action.error ??
               (action.kind === "replay"
                 ? action.replayResult?.message
-                : action.fixResult?.message)}
+                : action.kind === "fix"
+                  ? action.fixResult?.message
+                  : action.syncResult?.message)}
           </span>
         </div>
       )}
@@ -509,6 +582,19 @@ function EmployeePanel({
             Create in auth (replay events)
           </button>
         )}
+        {emp.actions.syncAuthFromCorp && (
+          <button
+            type="button"
+            className={isProd ? "btn-danger" : "btn-primary"}
+            onClick={onSyncAuth}
+            disabled={busy}
+          >
+            {working && action?.kind === "sync" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : null}
+            Sync auth with corp
+          </button>
+        )}
         {emp.actions.fixCognitoId && (
           <button
             type="button"
@@ -522,12 +608,25 @@ function EmployeePanel({
             Fix cognito_id in corp + auth
           </button>
         )}
+        {emp.actions.syncAuthBlockedReason && (
+          <span className="text-xs text-[hsl(var(--muted-foreground))]">
+            auth sync blocked: {emp.actions.syncAuthBlockedReason}
+          </span>
+        )}
         {emp.actions.fixCognitoIdBlockedReason && (
           <span className="text-xs text-[hsl(var(--muted-foreground))]">
             cognito_id fix blocked: {emp.actions.fixCognitoIdBlockedReason}
           </span>
         )}
       </div>
+
+      {emp.actions.cognitoAttributeDrift && (
+        <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
+          Note: the Cognito user&apos;s name/ucode differ from corp. This tool
+          never writes to Cognito (those are login-critical attributes) — fix
+          them in Cognito manually if needed.
+        </p>
+      )}
     </div>
   );
 }
@@ -631,8 +730,10 @@ function ConfirmModal({
   onConfirm: () => void;
 }) {
   const isReplay = action.kind === "replay";
+  const isSync = action.kind === "sync";
   const rp = action.replayPreview;
   const fp = action.fixPreview;
+  const sp = action.syncPreview;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
       <div className="card w-full max-w-lg p-5 space-y-4 max-h-[85vh] overflow-y-auto">
@@ -646,7 +747,9 @@ function ConfirmModal({
           <h3 className="text-sm font-semibold">
             {isReplay
               ? `Replay events to auth — ${action.shortCode}`
-              : `Fix cognito_id — ${action.shortCode}`}
+              : isSync
+                ? `Sync auth with corp — ${action.shortCode}`
+                : `Fix cognito_id — ${action.shortCode}`}
           </h3>
           <span
             className={clsx(
@@ -693,7 +796,40 @@ function ConfirmModal({
           </>
         )}
 
-        {!isReplay && fp && (
+        {isSync && sp && (
+          <>
+            <p className="text-xs text-[hsl(var(--muted-foreground))]">
+              The following auth columns will be overwritten with the corp
+              (source of truth) values:
+            </p>
+            <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
+                  <tr>
+                    <th className="text-left font-medium px-3 py-1.5">Field</th>
+                    <th className="text-left font-medium px-3 py-1.5">Auth (before)</th>
+                    <th className="text-left font-medium px-3 py-1.5">Corp (after)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sp.changes.map((c) => (
+                    <tr key={c.column} className="border-t border-[hsl(var(--border))]">
+                      <td className="px-3 py-1.5 font-medium whitespace-nowrap">{c.label}</td>
+                      <td className="px-3 py-1.5 font-mono break-all">
+                        {c.before?.trim() || "—"}
+                      </td>
+                      <td className="px-3 py-1.5 font-mono break-all text-emerald-700 dark:text-emerald-400">
+                        {c.after?.trim() || "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+
+        {action.kind === "fix" && fp && (
           <>
             <p className="text-xs text-[hsl(var(--muted-foreground))]">
               {fp.message}
@@ -744,7 +880,7 @@ function ConfirmModal({
             className={isProd ? "btn-danger" : "btn-primary"}
             onClick={onConfirm}
           >
-            {isReplay ? "Confirm replay" : "Confirm update"}
+            {isReplay ? "Confirm replay" : isSync ? "Confirm sync" : "Confirm update"}
           </button>
         </div>
       </div>

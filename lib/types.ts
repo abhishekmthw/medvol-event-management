@@ -430,6 +430,12 @@ export type CorrectionEmployee = {
     fixCognitoId: boolean;
     /** Why the cognito_id fix is currently blocked (when it IS needed). */
     fixCognitoIdBlockedReason?: string;
+    /** Auth exists but name / mobile / ucode drifted from corp → offer sync. */
+    syncAuthFromCorp: boolean;
+    /** Why the auth sync is currently blocked (when drift exists). */
+    syncAuthBlockedReason?: string;
+    /** Cognito name/ucode drift exists — not auto-corrected by this tool. */
+    cognitoAttributeDrift: boolean;
   };
   /** Conditions that prevent automatic correction (need manual attention). */
   blockers: string[];
@@ -473,6 +479,24 @@ export type CorrectionFixResult = {
   sub: string;
   corp: { empmasterId: string; before: string | null; needsUpdate: boolean; updated: boolean };
   auth: { id: string; before: string | null; needsUpdate: boolean; updated: boolean };
+  preview: boolean;
+};
+
+/** One auth column the corp-sync would change (before → after). */
+export type CorrectionSyncChange = {
+  column: string;
+  label: string;
+  before: string | null;
+  after: string | null;
+};
+
+export type CorrectionSyncResult = {
+  ok: boolean;
+  message: string;
+  /** Auth Field_Force_Users.id being updated. */
+  authId: string;
+  changes: CorrectionSyncChange[];
+  updated: boolean;
   preview: boolean;
 };
 

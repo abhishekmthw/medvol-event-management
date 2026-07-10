@@ -1,6 +1,7 @@
 "use client";
 
 import clsx from "clsx";
+import { displayMobile10 } from "@/lib/format";
 import type { EmployeeCognitoRow } from "@/lib/types";
 
 /**
@@ -66,7 +67,11 @@ export function EmployeeCognitoTable({ rows }: { rows: EmployeeCognitoRow[] }) {
                   mismatch={r.flags.mobileMismatch || r.flags.corpMobileMismatch}
                 >
                   <Line label="auth" value={r.auth.mobile_no} mono />
-                  <CognitoLine row={r} value={r.cognito?.phone_number} mono />
+                  <CognitoLine
+                    row={r}
+                    value={displayMobile10(r.cognito?.phone_number)}
+                    mono
+                  />
                   <CorpLine row={r} value={r.corp?.mobile_no} mono />
                 </Stack>
               </Td>

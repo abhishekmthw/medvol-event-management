@@ -1,6 +1,7 @@
 "use client";
 
 import clsx from "clsx";
+import { displayMobile10 } from "@/lib/format";
 import type {
   AuthComparisonRow,
   CognitoLookup,
@@ -63,7 +64,7 @@ export function AuthComparisonTable({ rows }: { rows: AuthComparisonRow[] }) {
                   <Stack mismatch={r.flags.mobileMismatch}>
                     <Line label="corp" value={r.corp?.mobile_no} present={r.corp != null} mono />
                     <Line label="auth" value={r.auth?.mobile_no} present={r.flags.presentInAuth} mono />
-                    <CognitoLine cognito={r.cognito} pick={(u) => u.phone_number} mono />
+                    <CognitoLine cognito={r.cognito} pick={(u) => displayMobile10(u.phone_number)} mono />
                   </Stack>
                 </Td>
 
