@@ -16,6 +16,7 @@ import type {
   CorrectionEmployee,
   CorrectionField,
   CorrectionFixResult,
+  CorrectionReleaseResult,
   CorrectionReplayResult,
   CorrectionSyncResult,
   Environment,
@@ -34,7 +35,7 @@ import type {
  *      short code) into corp and auth.
  */
 
-type ActionKind = "replay" | "fix" | "sync";
+type ActionKind = "replay" | "fix" | "sync" | "release";
 
 type ActionState = {
   kind: ActionKind;
@@ -47,6 +48,8 @@ type ActionState = {
   fixResult?: CorrectionFixResult;
   syncPreview?: CorrectionSyncResult;
   syncResult?: CorrectionSyncResult;
+  releasePreview?: CorrectionReleaseResult;
+  releaseResult?: CorrectionReleaseResult;
   error?: string;
 };
 
@@ -317,6 +320,62 @@ export function DataCorrectionCard({
     }
   }
 
+  /* --------------------- release duplicate cognito_id --------------------- */
+
+  async function startRelease(emp: CorrectionEmployee) {
+    setPollNote(null);
+    setAction({
+      kind: "release",
+      empmasterId: emp.empmasterId,
+      shortCode: emp.shortCode,
+      phase: "previewing",
+    });
+    try {
+      const preview = await post<CorrectionReleaseResult>(
+        "/api/auth-comparison/correction/release-cognito",
+        { environment, empmasterId: emp.empmasterId, preview: true },
+      );
+      if (preview === null) return;
+      if (!preview.ok || preview.conflicts.length === 0) {
+        setAction((a) => a && { ...a, phase: "done", error: preview.message });
+        return;
+      }
+      setAction((a) => a && { ...a, phase: "confirm", releasePreview: preview });
+    } catch (e) {
+      setAction(
+        (a) =>
+          a && {
+            ...a,
+            phase: "done",
+            error: e instanceof Error ? e.message : String(e),
+          },
+      );
+    }
+  }
+
+  async function confirmRelease() {
+    if (!action || action.kind !== "release") return;
+    setAction({ ...action, phase: "running" });
+    try {
+      const run = await post<CorrectionReleaseResult>(
+        "/api/auth-comparison/correction/release-cognito",
+        { environment, empmasterId: action.empmasterId, preview: false },
+      );
+      if (run === null) return;
+      setAction((a) => a && { ...a, phase: "done", releaseResult: run });
+      await analyze(true);
+    } catch (e) {
+      setAction(
+        (a) =>
+          a && {
+            ...a,
+            phase: "done",
+            error: e instanceof Error ? e.message : String(e),
+          },
+      );
+    }
+  }
+
   const busy =
     analyzing ||
     polling ||
@@ -449,6 +508,7 @@ export function DataCorrectionCard({
               onCreateInAuth={() => startReplay(emp)}
               onFixCognito={() => startFix(emp)}
               onSyncAuth={() => startSync(emp)}
+              onReleaseDuplicate={() => startRelease(emp)}
             />
           ))}
         </div>
@@ -466,7 +526,9 @@ export function DataCorrectionCard({
               ? confirmReplay
               : action.kind === "fix"
                 ? confirmFix
-                : confirmSync
+                : action.kind === "sync"
+                  ? confirmSync
+                  : confirmRelease
           }
         />
       )}
@@ -484,6 +546,7 @@ function EmployeePanel({
   onCreateInAuth,
   onFixCognito,
   onSyncAuth,
+  onReleaseDuplicate,
 }: {
   emp: CorrectionEmployee;
   isProd: boolean;
@@ -492,6 +555,7 @@ function EmployeePanel({
   onCreateInAuth: () => void;
   onFixCognito: () => void;
   onSyncAuth: () => void;
+  onReleaseDuplicate: () => void;
 }) {
   const working = action?.phase === "previewing" || action?.phase === "running";
   return (
@@ -551,7 +615,8 @@ function EmployeePanel({
             action.error ||
               (action.kind === "replay" && !action.replayResult?.ok) ||
               (action.kind === "fix" && !action.fixResult?.ok) ||
-              (action.kind === "sync" && !action.syncResult?.ok)
+              (action.kind === "sync" && !action.syncResult?.ok) ||
+              (action.kind === "release" && !action.releaseResult?.ok)
               ? "border border-[hsl(var(--danger))]/40 bg-[hsl(var(--danger))]/10 text-[hsl(var(--danger))]"
               : "border border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400",
           )}
@@ -563,7 +628,9 @@ function EmployeePanel({
                 ? action.replayResult?.message
                 : action.kind === "fix"
                   ? action.fixResult?.message
-                  : action.syncResult?.message)}
+                  : action.kind === "sync"
+                    ? action.syncResult?.message
+                    : action.releaseResult?.message)}
           </span>
         </div>
       )}
@@ -593,6 +660,19 @@ function EmployeePanel({
               <Loader2 className="h-4 w-4 animate-spin" />
             ) : null}
             Sync auth with corp
+          </button>
+        )}
+        {emp.actions.releaseDuplicateCognitoId && (
+          <button
+            type="button"
+            className={isProd ? "btn-danger" : "btn-primary"}
+            onClick={onReleaseDuplicate}
+            disabled={busy}
+          >
+            {working && action?.kind === "release" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : null}
+            Release duplicate cognito_id
           </button>
         )}
         {emp.actions.fixCognitoId && (
@@ -731,9 +811,11 @@ function ConfirmModal({
 }) {
   const isReplay = action.kind === "replay";
   const isSync = action.kind === "sync";
+  const isRelease = action.kind === "release";
   const rp = action.replayPreview;
   const fp = action.fixPreview;
   const sp = action.syncPreview;
+  const lp = action.releasePreview;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
       <div className="card w-full max-w-lg p-5 space-y-4 max-h-[85vh] overflow-y-auto">
@@ -749,7 +831,9 @@ function ConfirmModal({
               ? `Replay events to auth — ${action.shortCode}`
               : isSync
                 ? `Sync auth with corp — ${action.shortCode}`
-                : `Fix cognito_id — ${action.shortCode}`}
+                : isRelease
+                  ? `Release duplicate cognito_id — ${action.shortCode}`
+                  : `Fix cognito_id — ${action.shortCode}`}
           </h3>
           <span
             className={clsx(
@@ -829,6 +913,54 @@ function ConfirmModal({
           </>
         )}
 
+        {isRelease && lp && (
+          <>
+            <p className="text-xs text-[hsl(var(--muted-foreground))]">
+              The sub <code className="font-mono break-all">{lp.sub}</code>{" "}
+              belongs to <b>{action.shortCode}</b> (verified by corp mobile +
+              short code) but is also stored on the record
+              {lp.conflicts.length === 1 ? "" : "s"} below. Their{" "}
+              <code>cognito_id</code> will be set to <b>NULL</b> so the sub
+              identifies exactly one record. This employee&apos;s own rows are
+              not touched.
+            </p>
+            <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
+                  <tr>
+                    <th className="text-left font-medium px-3 py-1.5">Source</th>
+                    <th className="text-left font-medium px-3 py-1.5">Record</th>
+                    <th className="text-left font-medium px-3 py-1.5">Short code</th>
+                    <th className="text-left font-medium px-3 py-1.5">Company</th>
+                    <th className="text-left font-medium px-3 py-1.5">Name</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {lp.conflicts.map((c) => (
+                    <tr
+                      key={`${c.source}-${c.id}`}
+                      className="border-t border-[hsl(var(--border))]"
+                    >
+                      <td className="px-3 py-1.5 whitespace-nowrap">
+                        {c.source === "corp" ? "corp empmaster_hdr" : "auth Field_Force_Users"}
+                      </td>
+                      <td className="px-3 py-1.5 font-mono">{c.id}</td>
+                      <td className="px-3 py-1.5 font-mono">{c.shortCode?.trim() || "—"}</td>
+                      <td className="px-3 py-1.5 font-mono">{c.companyCode?.trim() || "—"}</td>
+                      <td className="px-3 py-1.5">{c.name?.trim() || "—"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
+              Note: the cleared record{lp.conflicts.length === 1 ? "" : "s"} will
+              be left without a cognito_id. If that user should have one, run a
+              correction for their mobile number afterwards.
+            </p>
+          </>
+        )}
+
         {action.kind === "fix" && fp && (
           <>
             <p className="text-xs text-[hsl(var(--muted-foreground))]">
@@ -880,7 +1012,13 @@ function ConfirmModal({
             className={isProd ? "btn-danger" : "btn-primary"}
             onClick={onConfirm}
           >
-            {isReplay ? "Confirm replay" : isSync ? "Confirm sync" : "Confirm update"}
+            {isReplay
+              ? "Confirm replay"
+              : isSync
+                ? "Confirm sync"
+                : isRelease
+                  ? "Confirm release"
+                  : "Confirm update"}
           </button>
         </div>
       </div>

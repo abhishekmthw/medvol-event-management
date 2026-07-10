@@ -6,10 +6,12 @@ import { sendAuthQueueMessage } from "./sqs";
 import type {
   CognitoUserInfo,
   CorrectionAnalyzeResult,
+  CorrectionConflict,
   CorrectionEmployee,
   CorrectionEventSummary,
   CorrectionField,
   CorrectionFixResult,
+  CorrectionReleaseResult,
   CorrectionReplayResult,
   CorrectionSyncChange,
   CorrectionSyncResult,
@@ -198,15 +200,6 @@ async function resolveCognito(
 
 /* --------------------- cognito_id duplicate guard --------------------- */
 
-/** Another corp/auth record already holding a cognito_id we'd write. */
-type CognitoIdConflict = {
-  source: "corp" | "auth";
-  id: string;
-  shortCode: string | null;
-  companyCode: string | null;
-  name: string | null;
-};
-
 /**
  * Rows OTHER than the employee being corrected that already store the given
  * sub as their cognito_id — in corp `empmaster_hdr` and auth
@@ -214,12 +207,12 @@ type CognitoIdConflict = {
  * table; writing a sub that exists elsewhere would create a duplicate (this
  * happened once in production), so any hit blocks the fix.
  */
-async function findCognitoIdConflicts(
+async function findCorrectionConflicts(
   environment: Environment,
   sub: string,
   excludeCorpId: string,
   excludeAuthId: string | null,
-): Promise<CognitoIdConflict[]> {
+): Promise<CorrectionConflict[]> {
   const corpPool = getPool({ environment, service: "corp", instance: null });
   const authPool = getAuthPool(environment);
   const schema = authSchema(environment);
@@ -248,7 +241,7 @@ async function findCognitoIdConflicts(
 
   return [
     ...corpRes.rows.map(
-      (r): CognitoIdConflict => ({
+      (r): CorrectionConflict => ({
         source: "corp",
         id: r.id,
         shortCode: r.short_code,
@@ -257,7 +250,7 @@ async function findCognitoIdConflicts(
       }),
     ),
     ...authRes.rows.map(
-      (r): CognitoIdConflict => ({
+      (r): CorrectionConflict => ({
         source: "auth",
         id: r.id,
         shortCode: r.short_code,
@@ -268,7 +261,7 @@ async function findCognitoIdConflicts(
   ];
 }
 
-function describeConflicts(conflicts: CognitoIdConflict[]): string {
+function describeConflicts(conflicts: CorrectionConflict[]): string {
   return conflicts
     .map((c) => {
       const bits = [
@@ -493,6 +486,8 @@ function buildEmployee(
       syncAuthFromCorp: syncNeeded && !syncBlockedReason,
       syncAuthBlockedReason: syncBlockedReason,
       cognitoAttributeDrift,
+      // Set by the analyze post-pass when the live sub is found duplicated.
+      releaseDuplicateCognitoId: false,
     },
     blockers,
     statuses,
@@ -564,7 +559,7 @@ export async function analyzeByMobile(
   for (const emp of employees) {
     const sub = norm(emp.cognitoTarget?.sub);
     if (!sub) continue;
-    const conflicts = await findCognitoIdConflicts(
+    const conflicts = await findCorrectionConflicts(
       environment,
       sub,
       emp.empmasterId,
@@ -574,10 +569,13 @@ export async function analyzeByMobile(
       emp.blockers.push(
         `Cognito sub is also stored on: ${describeConflicts(conflicts)} — a cognito_id must identify exactly one record`,
       );
+      // Offer to NULL the sub on the other records — this employee is its
+      // verified owner (matched by corp mobile + short code).
+      emp.actions.releaseDuplicateCognitoId = true;
       if (emp.actions.fixCognitoId) {
         emp.actions.fixCognitoId = false;
         emp.actions.fixCognitoIdBlockedReason =
-          "The live sub is already stored on another record — resolve the duplicate first";
+          "The live sub is already stored on another record — release the duplicate first";
       }
       emp.consistent = false;
     }
@@ -788,7 +786,7 @@ export async function fixCognitoId(
   // Duplicate guard (hard, on preview AND run): never write a sub that any
   // OTHER corp/auth record already stores — a cognito_id must identify
   // exactly one record per table.
-  const conflicts = await findCognitoIdConflicts(
+  const conflicts = await findCorrectionConflicts(
     environment,
     sub,
     corp.empmaster_id,
@@ -940,6 +938,119 @@ export async function syncAuthFromCorp(
     authId: auth.id,
     changes,
     updated: true,
+    preview: false,
+  };
+}
+
+/* ------------------ action 4: release duplicate cognito_id ------------------ */
+
+/**
+ * NULL the cognito_id on every OTHER corp/auth record that stores this
+ * employee's live sub. The employee analyzed is the sub's verified owner
+ * (the Cognito user is resolved by corp mobile + short-code guard), so any
+ * other record holding it is stale — e.g. an old/vacancy record the sub was
+ * once written to. The run clears a row only while it STILL holds that exact
+ * sub (`AND cognito_id = $sub`), so a concurrently-corrected record is never
+ * clobbered. Preview lists the records without writing.
+ */
+export async function releaseDuplicateCognitoId(
+  environment: Environment,
+  empmasterId: string,
+  preview: boolean,
+): Promise<CorrectionReleaseResult> {
+  const fail = (message: string): CorrectionReleaseResult => ({
+    ok: false,
+    message,
+    sub: "",
+    conflicts: [],
+    cleared: 0,
+    preview,
+  });
+
+  const corp = await fetchCorpById(environment, empmasterId);
+  if (!corp) return fail(`No corp employee with empmaster_id ${empmasterId}.`);
+
+  const mobile10 = normalizeMobile(corp.mobile_no);
+  if (!mobile10) return fail("Corp employee has no mobile number — cannot resolve the Cognito user.");
+
+  const authMatches = (
+    await fetchAuthByShortCodes(environment, [norm(corp.emp_shortcode)].filter(Boolean))
+  ).filter(
+    (a) =>
+      pairKey(a.short_code, a.company_code) ===
+      pairKey(corp.emp_shortcode, corp.company_code),
+  );
+  if (authMatches.length > 1) {
+    return fail(
+      `${authMatches.length} auth records match (short code, company code) — resolve the duplicate manually.`,
+    );
+  }
+  const auth = authMatches[0] ?? null;
+
+  const cog = await resolveCognito(environment, mobile10, corp.emp_shortcode);
+  if (cog.error) return fail(cog.error);
+  if (!cog.target || !norm(cog.target.sub)) {
+    return fail(cog.blocker ?? "No Cognito user could be resolved for this employee.");
+  }
+  const sub = norm(cog.target.sub);
+
+  const conflicts = await findCorrectionConflicts(
+    environment,
+    sub,
+    corp.empmaster_id,
+    auth?.id ?? null,
+  );
+  if (conflicts.length === 0) {
+    return {
+      ok: true,
+      message: `No other record stores ${sub} — nothing to release.`,
+      sub,
+      conflicts: [],
+      cleared: 0,
+      preview,
+    };
+  }
+
+  if (preview) {
+    return {
+      ok: true,
+      message: `Would set cognito_id to NULL on ${conflicts.length} record${conflicts.length === 1 ? "" : "s"} so that ${norm(corp.emp_shortcode)} remains the sub's only holder.`,
+      sub,
+      conflicts,
+      cleared: 0,
+      preview: true,
+    };
+  }
+
+  const corpIds = conflicts.filter((c) => c.source === "corp").map((c) => c.id);
+  const authIds = conflicts.filter((c) => c.source === "auth").map((c) => c.id);
+  let cleared = 0;
+  if (corpIds.length > 0) {
+    const pool = getPool({ environment, service: "corp", instance: null });
+    const res = await pool.query(
+      `UPDATE public.empmaster_hdr SET cognito_id = NULL
+       WHERE empmaster_id = ANY($1::integer[]) AND cognito_id = $2`,
+      [corpIds, sub],
+    );
+    cleared += res.rowCount ?? 0;
+  }
+  if (authIds.length > 0) {
+    const pool = getAuthPool(environment);
+    const schema = authSchema(environment);
+    const res = await pool.query(
+      `UPDATE "${schema}"."Field_Force_Users" SET cognito_id = NULL
+       WHERE id = ANY($1::integer[]) AND cognito_id = $2`,
+      [authIds, sub],
+    );
+    cleared += res.rowCount ?? 0;
+  }
+
+  return {
+    ok: true,
+    message: `Cleared cognito_id on ${cleared} record${cleared === 1 ? "" : "s"} — ${norm(corp.emp_shortcode)} is now the only holder of ${sub}.`,
+    sub,
+    conflicts,
+    cleared,
     preview: false,
   };
 }

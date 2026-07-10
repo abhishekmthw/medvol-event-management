@@ -436,6 +436,8 @@ export type CorrectionEmployee = {
     syncAuthBlockedReason?: string;
     /** Cognito name/ucode drift exists — not auto-corrected by this tool. */
     cognitoAttributeDrift: boolean;
+    /** The live sub is also stored on other records → offer to NULL it there. */
+    releaseDuplicateCognitoId: boolean;
   };
   /** Conditions that prevent automatic correction (need manual attention). */
   blockers: string[];
@@ -479,6 +481,28 @@ export type CorrectionFixResult = {
   sub: string;
   corp: { empmasterId: string; before: string | null; needsUpdate: boolean; updated: boolean };
   auth: { id: string; before: string | null; needsUpdate: boolean; updated: boolean };
+  preview: boolean;
+};
+
+/** Another corp/auth record holding a cognito_id that belongs to this employee. */
+export type CorrectionConflict = {
+  source: "corp" | "auth";
+  /** empmaster_id (corp) or Field_Force_Users.id (auth). */
+  id: string;
+  shortCode: string | null;
+  companyCode: string | null;
+  name: string | null;
+};
+
+export type CorrectionReleaseResult = {
+  ok: boolean;
+  message: string;
+  /** The live sub whose duplicates are being released. */
+  sub: string;
+  /** The records whose cognito_id would be / was set to NULL. */
+  conflicts: CorrectionConflict[];
+  /** Rows actually cleared (0 in preview). */
+  cleared: number;
   preview: boolean;
 };
 
