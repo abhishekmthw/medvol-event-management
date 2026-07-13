@@ -444,6 +444,9 @@ export type CorrectionEmployee = {
     /** No rightful Cognito user + the stored cognito_id is stale or belongs
      * to a different user → offer to NULL it on this employee's records. */
     clearWrongCognitoId: boolean;
+    /** The stored sub's Cognito owner matches the corp short code but holds a
+     * different mobile → offer to push the corp mobile to Cognito. */
+    fixCognitoPhone: boolean;
   };
   /** Conditions that prevent automatic correction (need manual attention). */
   blockers: string[];
@@ -510,6 +513,32 @@ export type CorrectionClearResult = {
   targets: { source: "corp" | "auth"; id: string; sub: string; reason: string }[];
   /** Rows actually cleared (0 in preview). */
   cleared: number;
+  preview: boolean;
+};
+
+/** A corp/auth employee currently holding the OLD (wrong) Cognito mobile. */
+export type CorrectionOldMobileHolder = {
+  source: "corp" | "auth";
+  id: string;
+  shortCode: string | null;
+  companyCode: string | null;
+  name: string | null;
+};
+
+export type CorrectionPhoneFixResult = {
+  ok: boolean;
+  message: string;
+  /** The Cognito user being updated. */
+  sub: string;
+  username: string;
+  /** Current (wrong) Cognito mobile, 10-digit display form. */
+  oldMobile: string | null;
+  /** Corp mobile that will be written, 10-digit display form. */
+  newMobile: string;
+  /** Corp/auth employees currently holding the OLD Cognito mobile — surfaced
+   * so the operator can analyze that number and correct them too. */
+  oldMobileHolders: CorrectionOldMobileHolder[];
+  updated: boolean;
   preview: boolean;
 };
 

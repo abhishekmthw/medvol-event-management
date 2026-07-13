@@ -1,4 +1,5 @@
 import {
+  AdminUpdateUserAttributesCommand,
   CognitoIdentityProviderClient,
   CognitoIdentityProviderServiceException,
   ListUsersCommand,
@@ -7,13 +8,19 @@ import {
 import type { CognitoUserInfo, Environment } from "./types";
 
 /**
- * Read-only Cognito access for the "Auth Details Comparison" tab. Looks
- * field-force users up by mobile number and by cognito id (sub) so the stored
- * `cognito_id` in the auth/corp DBs can be cross-checked against the live
- * Cognito identity. Mirrors the per-env client/credential pattern in
- * `lib/sqs.ts`: credentials and region come from the existing `{ENV}_AWS_*`
- * vars (shared with the SQS actions); only the user-pool id is Cognito-specific
- * (`{ENV}_COGNITO_USERPOOL_ID`). Performs ONLY `ListUsers` — never any write.
+ * Cognito access for the "Auth Details Comparison" tab. Looks field-force
+ * users up by mobile number and by cognito id (sub) so the stored `cognito_id`
+ * in the auth/corp DBs can be cross-checked against the live Cognito identity.
+ * Mirrors the per-env client/credential pattern in `lib/sqs.ts`: credentials
+ * and region come from the existing `{ENV}_AWS_*` vars (shared with the SQS
+ * actions); only the user-pool id is Cognito-specific
+ * (`{ENV}_COGNITO_USERPOOL_ID`).
+ *
+ * Reads are `ListUsers` only. The single write is `updateUserPhone`
+ * (AdminUpdateUserAttributes: phone_number + phone_number_verified) used by
+ * the Data Correction card's confirmed "Update Cognito mobile from corp"
+ * action — it mirrors auth-backend's own `updateCognitoUserPhoneNumber`.
+ * The IAM credentials need `cognito-idp:AdminUpdateUserAttributes` for it.
  */
 
 const DEFAULT_REGION = "ap-south-1";
@@ -120,6 +127,31 @@ export async function lookupBySub(
     }),
   );
   return (res.Users ?? []).map(parseUser);
+}
+
+/**
+ * Set a Cognito user's phone_number to `+91<mobile10>` and mark it verified —
+ * the exact attribute set auth-backend's `updateCognitoUserPhoneNumber` writes
+ * (unverified phones can't be used for SMS sign-in). The ONLY Cognito write in
+ * this app; called exclusively by the confirmed phone-fix correction action.
+ */
+export async function updateUserPhone(
+  environment: Environment,
+  username: string,
+  mobile10: string,
+): Promise<void> {
+  const cfg = resolveConfig(environment);
+  const client = getClient(cfg);
+  await client.send(
+    new AdminUpdateUserAttributesCommand({
+      UserPoolId: cfg.userPoolId,
+      Username: username,
+      UserAttributes: [
+        { Name: "phone_number", Value: `+91${mobile10}` },
+        { Name: "phone_number_verified", Value: "True" },
+      ],
+    }),
+  );
 }
 
 /** Human-readable, single-line description of a Cognito failure. */

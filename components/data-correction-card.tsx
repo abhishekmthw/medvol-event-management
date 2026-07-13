@@ -4,7 +4,9 @@ import { useRef, useState } from "react";
 import clsx from "clsx";
 import {
   AlertTriangle,
+  Check,
   CircleAlert,
+  Copy,
   Info,
   Loader2,
   RefreshCw,
@@ -18,6 +20,7 @@ import type {
   CorrectionEmployee,
   CorrectionField,
   CorrectionFixResult,
+  CorrectionPhoneFixResult,
   CorrectionReleaseResult,
   CorrectionReplayResult,
   CorrectionSyncResult,
@@ -37,7 +40,7 @@ import type {
  *      short code) into corp and auth.
  */
 
-type ActionKind = "replay" | "fix" | "sync" | "release" | "clear";
+type ActionKind = "replay" | "fix" | "sync" | "release" | "clear" | "phone";
 
 type ActionState = {
   kind: ActionKind;
@@ -54,6 +57,8 @@ type ActionState = {
   releaseResult?: CorrectionReleaseResult;
   clearPreview?: CorrectionClearResult;
   clearResult?: CorrectionClearResult;
+  phonePreview?: CorrectionPhoneFixResult;
+  phoneResult?: CorrectionPhoneFixResult;
   error?: string;
 };
 
@@ -436,6 +441,62 @@ export function DataCorrectionCard({
     }
   }
 
+  /* --------------------- update Cognito mobile from corp --------------------- */
+
+  async function startPhoneFix(emp: CorrectionEmployee) {
+    setPollNote(null);
+    setAction({
+      kind: "phone",
+      empmasterId: emp.empmasterId,
+      shortCode: emp.shortCode,
+      phase: "previewing",
+    });
+    try {
+      const preview = await post<CorrectionPhoneFixResult>(
+        "/api/auth-comparison/correction/fix-cognito-phone",
+        { environment, empmasterId: emp.empmasterId, preview: true },
+      );
+      if (preview === null) return;
+      if (!preview.ok) {
+        setAction((a) => a && { ...a, phase: "done", error: preview.message });
+        return;
+      }
+      setAction((a) => a && { ...a, phase: "confirm", phonePreview: preview });
+    } catch (e) {
+      setAction(
+        (a) =>
+          a && {
+            ...a,
+            phase: "done",
+            error: e instanceof Error ? e.message : String(e),
+          },
+      );
+    }
+  }
+
+  async function confirmPhoneFix() {
+    if (!action || action.kind !== "phone") return;
+    setAction({ ...action, phase: "running" });
+    try {
+      const run = await post<CorrectionPhoneFixResult>(
+        "/api/auth-comparison/correction/fix-cognito-phone",
+        { environment, empmasterId: action.empmasterId, preview: false },
+      );
+      if (run === null) return;
+      setAction((a) => a && { ...a, phase: "done", phoneResult: run });
+      await analyze(true);
+    } catch (e) {
+      setAction(
+        (a) =>
+          a && {
+            ...a,
+            phase: "done",
+            error: e instanceof Error ? e.message : String(e),
+          },
+      );
+    }
+  }
+
   const busy =
     analyzing ||
     polling ||
@@ -570,6 +631,7 @@ export function DataCorrectionCard({
               onSyncAuth={() => startSync(emp)}
               onReleaseDuplicate={() => startRelease(emp)}
               onClearWrong={() => startClear(emp)}
+              onFixPhone={() => startPhoneFix(emp)}
             />
           ))}
         </div>
@@ -591,7 +653,9 @@ export function DataCorrectionCard({
                   ? confirmSync
                   : action.kind === "release"
                     ? confirmRelease
-                    : confirmClear
+                    : action.kind === "clear"
+                      ? confirmClear
+                      : confirmPhoneFix
           }
         />
       )}
@@ -611,6 +675,7 @@ function EmployeePanel({
   onSyncAuth,
   onReleaseDuplicate,
   onClearWrong,
+  onFixPhone,
 }: {
   emp: CorrectionEmployee;
   isProd: boolean;
@@ -621,6 +686,7 @@ function EmployeePanel({
   onSyncAuth: () => void;
   onReleaseDuplicate: () => void;
   onClearWrong: () => void;
+  onFixPhone: () => void;
 }) {
   const working = action?.phase === "previewing" || action?.phase === "running";
   return (
@@ -659,7 +725,8 @@ function EmployeePanel({
           </p>
           {emp.storedSubOwners.map((o) => (
             <div key={o.sub} className="leading-snug">
-              <span className="font-mono break-all">{o.sub}</span>{" "}
+              <span className="font-mono break-all">{o.sub}</span>
+              <CopyButton value={o.sub} />{" "}
               <span className="text-[hsl(var(--muted-foreground))]">
                 (stored in {o.sources.join(" + ")})
               </span>{" "}
@@ -731,7 +798,8 @@ function EmployeePanel({
               (action.kind === "fix" && !action.fixResult?.ok) ||
               (action.kind === "sync" && !action.syncResult?.ok) ||
               (action.kind === "release" && !action.releaseResult?.ok) ||
-              (action.kind === "clear" && !action.clearResult?.ok)
+              (action.kind === "clear" && !action.clearResult?.ok) ||
+              (action.kind === "phone" && !action.phoneResult?.ok)
               ? "border border-[hsl(var(--danger))]/40 bg-[hsl(var(--danger))]/10 text-[hsl(var(--danger))]"
               : "border border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400",
           )}
@@ -747,7 +815,9 @@ function EmployeePanel({
                     ? action.syncResult?.message
                     : action.kind === "release"
                       ? action.releaseResult?.message
-                      : action.clearResult?.message)}
+                      : action.kind === "clear"
+                        ? action.clearResult?.message
+                        : action.phoneResult?.message)}
           </span>
         </div>
       )}
@@ -805,6 +875,19 @@ function EmployeePanel({
             Clear wrong cognito_id
           </button>
         )}
+        {emp.actions.fixCognitoPhone && (
+          <button
+            type="button"
+            className={isProd ? "btn-danger" : "btn-primary"}
+            onClick={onFixPhone}
+            disabled={busy}
+          >
+            {working && action?.kind === "phone" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : null}
+            Update Cognito mobile from corp
+          </button>
+        )}
         {emp.actions.fixCognitoId && (
           <button
             type="button"
@@ -832,12 +915,41 @@ function EmployeePanel({
 
       {emp.actions.cognitoAttributeDrift && (
         <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
-          Note: the Cognito user&apos;s name/ucode differ from corp. This tool
-          never writes to Cognito (those are login-critical attributes) — fix
-          them in Cognito manually if needed.
+          Note: the Cognito user&apos;s name/ucode differ from corp. The only
+          Cognito attribute this tool writes is the mobile number (via
+          &quot;Update Cognito mobile from corp&quot;) — fix name/ucode in
+          Cognito manually if needed.
         </p>
       )}
     </div>
+  );
+}
+
+/* ------------------------------ copy button ------------------------------ */
+
+function CopyButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      type="button"
+      className="inline-flex items-center align-middle ml-1.5 text-[hsl(var(--muted-foreground))] hover:text-[hsl(var(--foreground))]"
+      title="Copy to clipboard"
+      onClick={async () => {
+        try {
+          await navigator.clipboard.writeText(value);
+          setCopied(true);
+          setTimeout(() => setCopied(false), 1500);
+        } catch {
+          // Clipboard unavailable (permissions/insecure context) — ignore.
+        }
+      }}
+    >
+      {copied ? (
+        <Check className="h-3 w-3 text-emerald-500" />
+      ) : (
+        <Copy className="h-3 w-3" />
+      )}
+    </button>
   );
 }
 
@@ -870,18 +982,25 @@ function FieldTable({ fields }: { fields: CorrectionField[] }) {
                   </span>
                 )}
               </td>
-              <ValueCell value={f.corp.value} present mismatch={f.corp.mismatch} />
+              <ValueCell
+                value={f.corp.value}
+                present
+                mismatch={f.corp.mismatch}
+                copyable={f.key === "cognitoId"}
+              />
               <ValueCell
                 value={f.auth.value}
                 present={f.auth.present}
                 mismatch={f.auth.mismatch}
                 absentLabel="missing in auth"
+                copyable={f.key === "cognitoId"}
               />
               <ValueCell
                 value={f.cognito.value}
                 present={f.cognito.present}
                 mismatch={f.cognito.mismatch}
                 absentLabel="no user resolved"
+                copyable={f.key === "cognitoId"}
               />
             </tr>
           ))}
@@ -896,12 +1015,15 @@ function ValueCell({
   present,
   mismatch,
   absentLabel = "absent",
+  copyable,
 }: {
   value: string | null;
   present: boolean;
   mismatch: boolean;
   absentLabel?: string;
+  copyable?: boolean;
 }) {
+  const hasValue = present && Boolean(value && value.trim());
   return (
     <td className="px-3 py-2">
       <span
@@ -914,12 +1036,13 @@ function ValueCell({
           <span className="italic text-[hsl(var(--muted-foreground))] font-sans">
             {absentLabel}
           </span>
-        ) : value && value.trim() ? (
+        ) : hasValue ? (
           value
         ) : (
           <span className="text-[hsl(var(--muted-foreground))]">—</span>
         )}
       </span>
+      {copyable && hasValue && <CopyButton value={value!.trim()} />}
     </td>
   );
 }
@@ -943,11 +1066,13 @@ function ConfirmModal({
   const isSync = action.kind === "sync";
   const isRelease = action.kind === "release";
   const isClear = action.kind === "clear";
+  const isPhone = action.kind === "phone";
   const rp = action.replayPreview;
   const fp = action.fixPreview;
   const sp = action.syncPreview;
   const lp = action.releasePreview;
   const cp = action.clearPreview;
+  const pp = action.phonePreview;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
       <div className="card w-full max-w-lg p-5 space-y-4 max-h-[85vh] overflow-y-auto">
@@ -967,7 +1092,9 @@ function ConfirmModal({
                   ? `Release duplicate cognito_id — ${action.shortCode}`
                   : isClear
                     ? `Clear wrong cognito_id — ${action.shortCode}`
-                    : `Fix cognito_id — ${action.shortCode}`}
+                    : isPhone
+                      ? `Update Cognito mobile — ${action.shortCode}`
+                      : `Fix cognito_id — ${action.shortCode}`}
           </h3>
           <span
             className={clsx(
@@ -1138,6 +1265,88 @@ function ConfirmModal({
           </>
         )}
 
+        {isPhone && pp && (
+          <>
+            <p className="text-xs text-[hsl(var(--muted-foreground))]">
+              The Cognito user of <b>{action.shortCode}</b> (matched by the
+              stored cognito_id + short code) holds the wrong mobile. Its{" "}
+              <code>phone_number</code> will be set to the corp mobile and
+              marked verified — this is a <b>write to Cognito</b> and changes
+              the number the user logs in with.
+            </p>
+            <div className="rounded-lg border border-[hsl(var(--border))] text-xs divide-y divide-[hsl(var(--border))]">
+              <div className="px-3 py-2 flex items-baseline gap-2">
+                <span className="w-28 shrink-0 text-[hsl(var(--muted-foreground))]">
+                  Cognito sub
+                </span>
+                <span className="font-mono break-all">{pp.sub}</span>
+              </div>
+              <div className="px-3 py-2 flex items-baseline gap-2">
+                <span className="w-28 shrink-0 text-[hsl(var(--muted-foreground))]">
+                  Mobile (before)
+                </span>
+                <span className="font-mono">{pp.oldMobile ?? "—"}</span>
+              </div>
+              <div className="px-3 py-2 flex items-baseline gap-2">
+                <span className="w-28 shrink-0 text-[hsl(var(--muted-foreground))]">
+                  Mobile (after)
+                </span>
+                <span className="font-mono text-emerald-700 dark:text-emerald-400">
+                  {pp.newMobile}
+                </span>
+                <span className="text-[hsl(var(--muted-foreground))]">
+                  (corp — source of truth)
+                </span>
+              </div>
+            </div>
+            {pp.oldMobileHolders.length > 0 ? (
+              <>
+                <p className="text-xs text-amber-700 dark:text-amber-400">
+                  The old Cognito mobile <b>{pp.oldMobile}</b> belongs to the
+                  following corp/auth record
+                  {pp.oldMobileHolders.length === 1 ? "" : "s"} — after this
+                  update frees the number in Cognito, analyze{" "}
+                  <b>{pp.oldMobile}</b> to bring that user in sync:
+                </p>
+                <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
+                      <tr>
+                        <th className="text-left font-medium px-3 py-1.5">Source</th>
+                        <th className="text-left font-medium px-3 py-1.5">Record</th>
+                        <th className="text-left font-medium px-3 py-1.5">Short code</th>
+                        <th className="text-left font-medium px-3 py-1.5">Company</th>
+                        <th className="text-left font-medium px-3 py-1.5">Name</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pp.oldMobileHolders.map((h) => (
+                        <tr
+                          key={`${h.source}-${h.id}`}
+                          className="border-t border-[hsl(var(--border))]"
+                        >
+                          <td className="px-3 py-1.5 whitespace-nowrap">
+                            {h.source === "corp" ? "corp empmaster_hdr" : "auth Field_Force_Users"}
+                          </td>
+                          <td className="px-3 py-1.5 font-mono">{h.id}</td>
+                          <td className="px-3 py-1.5 font-mono">{h.shortCode?.trim() || "—"}</td>
+                          <td className="px-3 py-1.5 font-mono">{h.companyCode?.trim() || "—"}</td>
+                          <td className="px-3 py-1.5">{h.name?.trim() || "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            ) : (
+              <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
+                No corp/auth employee holds the old mobile {pp.oldMobile ?? "—"} —
+                nothing else to correct afterwards.
+              </p>
+            )}
+          </>
+        )}
+
         {action.kind === "fix" && fp && (
           <>
             <p className="text-xs text-[hsl(var(--muted-foreground))]">
@@ -1197,7 +1406,9 @@ function ConfirmModal({
                   ? "Confirm release"
                   : isClear
                     ? "Confirm clear"
-                    : "Confirm update"}
+                    : isPhone
+                      ? "Confirm Cognito update"
+                      : "Confirm update"}
           </button>
         </div>
       </div>

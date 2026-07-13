@@ -1,5 +1,10 @@
 import { authSchema, getAuthPool, getPool } from "./db";
-import { describeCognitoError, lookupByMobile, lookupBySub } from "./cognito";
+import {
+  describeCognitoError,
+  lookupByMobile,
+  lookupBySub,
+  updateUserPhone,
+} from "./cognito";
 import { norm, normalizeMobile, pairKey } from "./auth-comparison";
 import { displayMobile10, normalizeName } from "./format";
 import { sendAuthQueueMessage } from "./sqs";
@@ -12,6 +17,8 @@ import type {
   CorrectionEventSummary,
   CorrectionField,
   CorrectionFixResult,
+  CorrectionOldMobileHolder,
+  CorrectionPhoneFixResult,
   CorrectionReleaseResult,
   CorrectionReplayResult,
   CorrectionStoredSubOwner,
@@ -554,6 +561,9 @@ function buildEmployee(
       releaseDuplicateCognitoId: false,
       // Set by the analyze post-pass when the stored sub is stale/foreign.
       clearWrongCognitoId: false,
+      // Set by the analyze post-pass when the stored sub's owner matches the
+      // corp short code but holds a different mobile in Cognito.
+      fixCognitoPhone: false,
     },
     blockers,
     statuses,
@@ -675,10 +685,12 @@ export async function analyzeByMobile(
         emp.statuses.push(`${sides} cognito_id ${describeWrongSub(o)}`);
       } else {
         // Owner matches the corp short code but wasn't found by the corp
-        // mobile — the Cognito phone_number is outdated. Not clearable.
+        // mobile — the Cognito phone_number is outdated. Fixable by pushing
+        // the corp mobile to Cognito.
         emp.statuses.push(
-          `${sides} cognito_id belongs to a matching user whose Cognito mobile is ${displayMobile10(o.user?.phone_number) ?? "—"} — update the phone in Cognito manually`,
+          `${sides} cognito_id belongs to a matching user whose Cognito mobile is ${displayMobile10(o.user?.phone_number) ?? "—"} — corp mobile can be pushed to Cognito`,
         );
+        if (!targetSub) emp.actions.fixCognitoPhone = true;
       }
     }
     if (!targetSub && owners.some((o) => o.wrong)) {
@@ -1248,7 +1260,7 @@ export async function clearWrongCognitoId(
   }
   if (targets.length === 0) {
     return fail(
-      "The stored cognito_id belongs to a Cognito user with this short code (only the Cognito mobile differs) — update the phone in Cognito manually instead of clearing.",
+      "The stored cognito_id belongs to a Cognito user with this short code (only the Cognito mobile differs) — use “Update Cognito mobile from corp” instead of clearing.",
     );
   }
 
@@ -1289,6 +1301,185 @@ export async function clearWrongCognitoId(
     message: `Cleared the wrong cognito_id on ${cleared} record${cleared === 1 ? "" : "s"} of ${norm(corp.emp_shortcode)}. If this employee should have a Cognito account, it must be signed up / corrected separately; to fix the sub's real owner, analyze their mobile number.`,
     targets,
     cleared,
+    preview: false,
+  };
+}
+
+/* ------------------ action 6: update Cognito mobile from corp ------------------ */
+
+/**
+ * Push the corp mobile onto the employee's Cognito user when the stored
+ * cognito_id's owner MATCHES the corp short code but holds a different
+ * phone_number (so the mobile lookup couldn't resolve it). Mirrors
+ * auth-backend's own `updateCognitoUserPhoneNumber` (phone_number +91… +
+ * phone_number_verified) — the tool's only Cognito write. Guards:
+ *   - refused when a Cognito user already holds the corp mobile (the phone is
+ *     a sign-in alias; if it's the rightful user, `fixCognitoId` applies —
+ *     if a different user, that account must be corrected first);
+ *   - the owner's `custom:emp_short_code` must equal the corp short code;
+ *   - the OLD Cognito mobile is searched in corp + auth and any employees
+ *     holding it are reported (analyze that number afterwards to bring the
+ *     other user in sync — updating this phone frees the number for them).
+ */
+export async function fixCognitoPhone(
+  environment: Environment,
+  empmasterId: string,
+  preview: boolean,
+): Promise<CorrectionPhoneFixResult> {
+  const fail = (message: string): CorrectionPhoneFixResult => ({
+    ok: false,
+    message,
+    sub: "",
+    username: "",
+    oldMobile: null,
+    newMobile: "",
+    oldMobileHolders: [],
+    updated: false,
+    preview,
+  });
+
+  const corp = await fetchCorpById(environment, empmasterId);
+  if (!corp) return fail(`No corp employee with empmaster_id ${empmasterId}.`);
+
+  const mobile10 = normalizeMobile(corp.mobile_no);
+  if (!mobile10) return fail("Corp employee has no mobile number — nothing to push to Cognito.");
+
+  const authMatches = (
+    await fetchAuthByShortCodes(environment, [norm(corp.emp_shortcode)].filter(Boolean))
+  ).filter(
+    (a) =>
+      pairKey(a.short_code, a.company_code) ===
+      pairKey(corp.emp_shortcode, corp.company_code),
+  );
+  if (authMatches.length > 1) {
+    return fail(
+      `${authMatches.length} auth records match (short code, company code) — resolve the duplicate manually.`,
+    );
+  }
+  const auth = authMatches[0] ?? null;
+
+  // The corp mobile must be free in Cognito — phone_number is a sign-in alias.
+  const cog = await resolveCognito(environment, mobile10, corp.emp_shortcode);
+  if (cog.error) return fail(cog.error);
+  if (cog.target && norm(cog.target.sub)) {
+    return fail(
+      "A Cognito user already holds the corp mobile with a matching short code — use “Fix cognito_id in corp + auth” instead.",
+    );
+  }
+  if (cog.byMobile.length > 0) {
+    const other = cog.byMobile[0];
+    return fail(
+      `Another Cognito user already holds the corp mobile ${mobile10} (short code ${norm(other.emp_short_code) || "—"}) — correct that account first; a phone number can only belong to one Cognito user.`,
+    );
+  }
+
+  // Resolve the employee's own Cognito user via the stored cognito_id.
+  const owners = await resolveStoredSubOwners(
+    environment,
+    norm(corp.cognito_id),
+    norm(auth?.cognito_id),
+    "",
+    corp.emp_shortcode,
+  );
+  if (owners.length === 0) {
+    return fail("No cognito_id is stored on this employee — there is no Cognito user to update.");
+  }
+  const lookupError = owners.find((o) => o.error);
+  if (lookupError) return fail(lookupError.error!);
+
+  const matching = owners.filter((o) => !o.wrong && o.user !== null);
+  if (matching.length === 0) {
+    return fail(
+      "The stored cognito_id is stale or belongs to a different user — use “Clear wrong cognito_id” instead.",
+    );
+  }
+  if (matching.length > 1) {
+    return fail(
+      "Multiple stored cognito_ids resolve to matching Cognito users — resolve manually.",
+    );
+  }
+  const owner = matching[0].user!;
+  const sub = norm(owner.sub);
+  const username = norm(owner.username);
+  if (!username) return fail("The Cognito user has no username — cannot update.");
+
+  const oldMobile = displayMobile10(owner.phone_number);
+  if (oldMobile === mobile10) {
+    return fail(
+      "The Cognito mobile already equals the corp mobile — re-run Analyze; nothing to update.",
+    );
+  }
+
+  // Who currently holds the OLD Cognito mobile in corp/auth — reported so the
+  // operator brings that user in sync afterwards (this update frees the
+  // number in Cognito for them).
+  const oldMobileHolders: CorrectionOldMobileHolder[] = [];
+  if (oldMobile) {
+    const corpPool = getPool({ environment, service: "corp", instance: null });
+    const authPool = getAuthPool(environment);
+    const schema = authSchema(environment);
+    const [corpRes, authRes] = await Promise.all([
+      corpPool.query(
+        `SELECT empmaster_id::text AS id, emp_shortcode AS short_code,
+                company_code::text AS company_code, emp_name AS name
+         FROM public.empmaster_hdr
+         WHERE mobile_no = $1::numeric AND empmaster_id <> $2::integer
+         ORDER BY empmaster_id`,
+        [oldMobile, corp.empmaster_id],
+      ),
+      authPool.query(
+        `SELECT id::text AS id, short_code, company_code::text AS company_code, name
+         FROM "${schema}"."Field_Force_Users"
+         WHERE mobile_no = $1${auth ? " AND id <> $2::integer" : ""}
+         ORDER BY id`,
+        auth ? [oldMobile, auth.id] : [oldMobile],
+      ),
+    ]);
+    for (const r of corpRes.rows) {
+      oldMobileHolders.push({
+        source: "corp",
+        id: r.id,
+        shortCode: r.short_code,
+        companyCode: r.company_code,
+        name: r.name,
+      });
+    }
+    for (const r of authRes.rows) {
+      oldMobileHolders.push({
+        source: "auth",
+        id: r.id,
+        shortCode: r.short_code,
+        companyCode: r.company_code,
+        name: r.name,
+      });
+    }
+  }
+
+  if (preview) {
+    return {
+      ok: true,
+      message: `Would update Cognito user ${username} (sub ${sub}) phone from ${oldMobile ?? "—"} to the corp mobile ${mobile10} (marked verified).`,
+      sub,
+      username,
+      oldMobile,
+      newMobile: mobile10,
+      oldMobileHolders,
+      updated: false,
+      preview: true,
+    };
+  }
+
+  await updateUserPhone(environment, username, mobile10);
+
+  return {
+    ok: true,
+    message: `Updated the Cognito mobile of ${norm(corp.emp_shortcode)} from ${oldMobile ?? "—"} to ${mobile10}. Re-check to confirm — the fix action can then align corp/auth cognito_id if still needed.${oldMobileHolders.length > 0 ? ` Now analyze ${oldMobile} to bring its corp/auth holder in sync.` : ""}`,
+    sub,
+    username,
+    oldMobile,
+    newMobile: mobile10,
+    oldMobileHolders,
+    updated: true,
     preview: false,
   };
 }
