@@ -17,6 +17,7 @@ import { displayMobile10 } from "@/lib/format";
 import type {
   CorrectionAnalyzeResult,
   CorrectionClearResult,
+  CorrectionCognitoSyncResult,
   CorrectionEmployee,
   CorrectionField,
   CorrectionFixResult,
@@ -40,7 +41,14 @@ import type {
  *      short code) into corp and auth.
  */
 
-type ActionKind = "replay" | "fix" | "sync" | "release" | "clear" | "phone";
+type ActionKind =
+  | "replay"
+  | "fix"
+  | "sync"
+  | "release"
+  | "clear"
+  | "phone"
+  | "attrs";
 
 type ActionState = {
   kind: ActionKind;
@@ -59,6 +67,8 @@ type ActionState = {
   clearResult?: CorrectionClearResult;
   phonePreview?: CorrectionPhoneFixResult;
   phoneResult?: CorrectionPhoneFixResult;
+  attrsPreview?: CorrectionCognitoSyncResult;
+  attrsResult?: CorrectionCognitoSyncResult;
   error?: string;
 };
 
@@ -497,6 +507,62 @@ export function DataCorrectionCard({
     }
   }
 
+  /* ------------------- sync Cognito details from corp ------------------- */
+
+  async function startAttrsSync(emp: CorrectionEmployee) {
+    setPollNote(null);
+    setAction({
+      kind: "attrs",
+      empmasterId: emp.empmasterId,
+      shortCode: emp.shortCode,
+      phase: "previewing",
+    });
+    try {
+      const preview = await post<CorrectionCognitoSyncResult>(
+        "/api/auth-comparison/correction/sync-cognito-attrs",
+        { environment, empmasterId: emp.empmasterId, preview: true },
+      );
+      if (preview === null) return;
+      if (!preview.ok || preview.changes.length === 0) {
+        setAction((a) => a && { ...a, phase: "done", error: preview.message });
+        return;
+      }
+      setAction((a) => a && { ...a, phase: "confirm", attrsPreview: preview });
+    } catch (e) {
+      setAction(
+        (a) =>
+          a && {
+            ...a,
+            phase: "done",
+            error: e instanceof Error ? e.message : String(e),
+          },
+      );
+    }
+  }
+
+  async function confirmAttrsSync() {
+    if (!action || action.kind !== "attrs") return;
+    setAction({ ...action, phase: "running" });
+    try {
+      const run = await post<CorrectionCognitoSyncResult>(
+        "/api/auth-comparison/correction/sync-cognito-attrs",
+        { environment, empmasterId: action.empmasterId, preview: false },
+      );
+      if (run === null) return;
+      setAction((a) => a && { ...a, phase: "done", attrsResult: run });
+      await analyze(true);
+    } catch (e) {
+      setAction(
+        (a) =>
+          a && {
+            ...a,
+            phase: "done",
+            error: e instanceof Error ? e.message : String(e),
+          },
+      );
+    }
+  }
+
   const busy =
     analyzing ||
     polling ||
@@ -632,6 +698,7 @@ export function DataCorrectionCard({
               onReleaseDuplicate={() => startRelease(emp)}
               onClearWrong={() => startClear(emp)}
               onFixPhone={() => startPhoneFix(emp)}
+              onSyncAttrs={() => startAttrsSync(emp)}
             />
           ))}
         </div>
@@ -655,7 +722,9 @@ export function DataCorrectionCard({
                     ? confirmRelease
                     : action.kind === "clear"
                       ? confirmClear
-                      : confirmPhoneFix
+                      : action.kind === "phone"
+                        ? confirmPhoneFix
+                        : confirmAttrsSync
           }
         />
       )}
@@ -676,6 +745,7 @@ function EmployeePanel({
   onReleaseDuplicate,
   onClearWrong,
   onFixPhone,
+  onSyncAttrs,
 }: {
   emp: CorrectionEmployee;
   isProd: boolean;
@@ -687,6 +757,7 @@ function EmployeePanel({
   onReleaseDuplicate: () => void;
   onClearWrong: () => void;
   onFixPhone: () => void;
+  onSyncAttrs: () => void;
 }) {
   const working = action?.phase === "previewing" || action?.phase === "running";
   return (
@@ -799,7 +870,8 @@ function EmployeePanel({
               (action.kind === "sync" && !action.syncResult?.ok) ||
               (action.kind === "release" && !action.releaseResult?.ok) ||
               (action.kind === "clear" && !action.clearResult?.ok) ||
-              (action.kind === "phone" && !action.phoneResult?.ok)
+              (action.kind === "phone" && !action.phoneResult?.ok) ||
+              (action.kind === "attrs" && !action.attrsResult?.ok)
               ? "border border-[hsl(var(--danger))]/40 bg-[hsl(var(--danger))]/10 text-[hsl(var(--danger))]"
               : "border border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400",
           )}
@@ -817,7 +889,9 @@ function EmployeePanel({
                       ? action.releaseResult?.message
                       : action.kind === "clear"
                         ? action.clearResult?.message
-                        : action.phoneResult?.message)}
+                        : action.kind === "phone"
+                          ? action.phoneResult?.message
+                          : action.attrsResult?.message)}
           </span>
         </div>
       )}
@@ -886,6 +960,19 @@ function EmployeePanel({
               <Loader2 className="h-4 w-4 animate-spin" />
             ) : null}
             Update Cognito mobile from corp
+          </button>
+        )}
+        {emp.actions.syncCognitoAttributes && (
+          <button
+            type="button"
+            className={isProd ? "btn-danger" : "btn-primary"}
+            onClick={onSyncAttrs}
+            disabled={busy}
+          >
+            {working && action?.kind === "attrs" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : null}
+            Sync Cognito details from corp
           </button>
         )}
         {emp.actions.fixCognitoId && (
@@ -1067,12 +1154,14 @@ function ConfirmModal({
   const isRelease = action.kind === "release";
   const isClear = action.kind === "clear";
   const isPhone = action.kind === "phone";
+  const isAttrs = action.kind === "attrs";
   const rp = action.replayPreview;
   const fp = action.fixPreview;
   const sp = action.syncPreview;
   const lp = action.releasePreview;
   const cp = action.clearPreview;
   const pp = action.phonePreview;
+  const ap = action.attrsPreview;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
       <div className="card w-full max-w-lg p-5 space-y-4 max-h-[85vh] overflow-y-auto">
@@ -1094,7 +1183,9 @@ function ConfirmModal({
                     ? `Clear wrong cognito_id — ${action.shortCode}`
                     : isPhone
                       ? `Update Cognito mobile — ${action.shortCode}`
-                      : `Fix cognito_id — ${action.shortCode}`}
+                      : isAttrs
+                        ? `Sync Cognito details — ${action.shortCode}`
+                        : `Fix cognito_id — ${action.shortCode}`}
           </h3>
           <span
             className={clsx(
@@ -1347,6 +1438,89 @@ function ConfirmModal({
           </>
         )}
 
+        {isAttrs && ap && (
+          <>
+            <p className="text-xs text-[hsl(var(--muted-foreground))]">
+              This Cognito account holds the <b>corp mobile</b> of{" "}
+              <b>{action.shortCode}</b> and is linked from corp/auth by its
+              cognito_id, but its profile attributes still identify a
+              different employee. They will be overwritten with the corp
+              (source of truth) values — this is a <b>write to Cognito</b>.
+            </p>
+            <div className="rounded-lg border border-[hsl(var(--border))] text-xs divide-y divide-[hsl(var(--border))]">
+              <div className="px-3 py-2 flex items-baseline gap-2">
+                <span className="w-24 shrink-0 text-[hsl(var(--muted-foreground))]">
+                  Cognito sub
+                </span>
+                <span className="font-mono break-all">{ap.sub}</span>
+              </div>
+            </div>
+            <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
+                  <tr>
+                    <th className="text-left font-medium px-3 py-1.5">Attribute</th>
+                    <th className="text-left font-medium px-3 py-1.5">Cognito (before)</th>
+                    <th className="text-left font-medium px-3 py-1.5">Corp (after)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {ap.changes.map((c) => (
+                    <tr key={c.attribute} className="border-t border-[hsl(var(--border))]">
+                      <td className="px-3 py-1.5 font-medium whitespace-nowrap">{c.label}</td>
+                      <td className="px-3 py-1.5 font-mono break-all">
+                        {c.before?.trim() || "—"}
+                      </td>
+                      <td className="px-3 py-1.5 font-mono break-all text-emerald-700 dark:text-emerald-400">
+                        {c.after}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {ap.claimedBy.length > 0 ? (
+              <>
+                <p className="text-xs text-amber-700 dark:text-amber-400">
+                  The account currently claims to be short code{" "}
+                  <b>{ap.changes.find((c) => c.attribute === "custom:emp_short_code")?.before?.trim() || "—"}</b>
+                  , which exists in corp as the record
+                  {ap.claimedBy.length === 1 ? "" : "s"} below — verify that
+                  employee no longer uses this number (analyze their mobile if
+                  in doubt) before confirming:
+                </p>
+                <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
+                      <tr>
+                        <th className="text-left font-medium px-3 py-1.5">Record</th>
+                        <th className="text-left font-medium px-3 py-1.5">Short code</th>
+                        <th className="text-left font-medium px-3 py-1.5">Company</th>
+                        <th className="text-left font-medium px-3 py-1.5">Name</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ap.claimedBy.map((h) => (
+                        <tr key={h.id} className="border-t border-[hsl(var(--border))]">
+                          <td className="px-3 py-1.5 font-mono">{h.id}</td>
+                          <td className="px-3 py-1.5 font-mono">{h.shortCode?.trim() || "—"}</td>
+                          <td className="px-3 py-1.5 font-mono">{h.companyCode?.trim() || "—"}</td>
+                          <td className="px-3 py-1.5">{h.name?.trim() || "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            ) : (
+              <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
+                No corp employee carries the account&apos;s current short code —
+                the stale identity has no corp record behind it.
+              </p>
+            )}
+          </>
+        )}
+
         {action.kind === "fix" && fp && (
           <>
             <p className="text-xs text-[hsl(var(--muted-foreground))]">
@@ -1406,7 +1580,7 @@ function ConfirmModal({
                   ? "Confirm release"
                   : isClear
                     ? "Confirm clear"
-                    : isPhone
+                    : isPhone || isAttrs
                       ? "Confirm Cognito update"
                       : "Confirm update"}
           </button>

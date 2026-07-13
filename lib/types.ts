@@ -447,6 +447,9 @@ export type CorrectionEmployee = {
     /** The stored sub's Cognito owner matches the corp short code but holds a
      * different mobile → offer to push the corp mobile to Cognito. */
     fixCognitoPhone: boolean;
+    /** The stored sub's Cognito owner holds the corp mobile but its short
+     * code / name / ucode attributes are stale → offer to sync them from corp. */
+    syncCognitoAttributes: boolean;
   };
   /** Conditions that prevent automatic correction (need manual attention). */
   blockers: string[];
@@ -500,7 +503,11 @@ export type CorrectionStoredSubOwner = {
   sources: ("corp" | "auth")[];
   /** The Cognito user owning the sub, or null when not found (stale). */
   user: CognitoUserInfo | null;
-  /** True when stale or owned by a different user — i.e. clearable. */
+  /** The owner's Cognito phone equals the corp mobile — strong evidence the
+   * account IS this employee's even when its attributes are stale. */
+  phoneMatchesCorp: boolean;
+  /** True when stale, or owned by a user matching NEITHER short code nor
+   * mobile — i.e. clearable. A phone-matching owner is never "wrong". */
   wrong: boolean;
   /** Non-fatal lookup error (wrong is false when uncertain). */
   error?: string;
@@ -538,6 +545,28 @@ export type CorrectionPhoneFixResult = {
   /** Corp/auth employees currently holding the OLD Cognito mobile — surfaced
    * so the operator can analyze that number and correct them too. */
   oldMobileHolders: CorrectionOldMobileHolder[];
+  updated: boolean;
+  preview: boolean;
+};
+
+/** One Cognito attribute the corp-sync would change (before → after). */
+export type CorrectionCognitoAttrChange = {
+  attribute: string;
+  label: string;
+  before: string | null;
+  after: string;
+};
+
+export type CorrectionCognitoSyncResult = {
+  ok: boolean;
+  message: string;
+  /** The Cognito user being updated. */
+  sub: string;
+  username: string;
+  changes: CorrectionCognitoAttrChange[];
+  /** Corp employees whose short code equals the Cognito user's CURRENT
+   * (stale) short code — who the account currently claims to be. */
+  claimedBy: CorrectionOldMobileHolder[];
   updated: boolean;
   preview: boolean;
 };

@@ -130,15 +130,14 @@ export async function lookupBySub(
 }
 
 /**
- * Set a Cognito user's phone_number to `+91<mobile10>` and mark it verified —
- * the exact attribute set auth-backend's `updateCognitoUserPhoneNumber` writes
- * (unverified phones can't be used for SMS sign-in). The ONLY Cognito write in
- * this app; called exclusively by the confirmed phone-fix correction action.
+ * The app's only Cognito write path: `AdminUpdateUserAttributes` with an
+ * explicit attribute map. Called exclusively by the Data Correction card's
+ * confirmed actions (phone fix / attribute sync) — never by any read flow.
  */
-export async function updateUserPhone(
+export async function updateUserAttributes(
   environment: Environment,
   username: string,
-  mobile10: string,
+  attributes: Record<string, string>,
 ): Promise<void> {
   const cfg = resolveConfig(environment);
   const client = getClient(cfg);
@@ -146,12 +145,28 @@ export async function updateUserPhone(
     new AdminUpdateUserAttributesCommand({
       UserPoolId: cfg.userPoolId,
       Username: username,
-      UserAttributes: [
-        { Name: "phone_number", Value: `+91${mobile10}` },
-        { Name: "phone_number_verified", Value: "True" },
-      ],
+      UserAttributes: Object.entries(attributes).map(([Name, Value]) => ({
+        Name,
+        Value,
+      })),
     }),
   );
+}
+
+/**
+ * Set a Cognito user's phone_number to `+91<mobile10>` and mark it verified —
+ * the exact attribute set auth-backend's `updateCognitoUserPhoneNumber` writes
+ * (unverified phones can't be used for SMS sign-in).
+ */
+export function updateUserPhone(
+  environment: Environment,
+  username: string,
+  mobile10: string,
+): Promise<void> {
+  return updateUserAttributes(environment, username, {
+    phone_number: `+91${mobile10}`,
+    phone_number_verified: "True",
+  });
 }
 
 /** Human-readable, single-line description of a Cognito failure. */
