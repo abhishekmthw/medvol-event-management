@@ -1479,6 +1479,48 @@ function ConfirmModal({
                 </tbody>
               </table>
             </div>
+            {ap.releasedFrom.length > 0 && (
+              <>
+                <p className="text-xs text-red-600 dark:text-red-400">
+                  The sub is also stored on the record
+                  {ap.releasedFrom.length === 1 ? "" : "s"} below. Corp is the
+                  source of truth and this account holds{" "}
+                  <b>{action.shortCode}</b>&apos;s corp mobile, so those are
+                  stale links — their <b>cognito_id will be set to NULL</b> in
+                  the same run. Analyze those employees&apos; mobiles
+                  afterwards to relink them to their own accounts:
+                </p>
+                <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
+                  <table className="w-full text-xs">
+                    <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
+                      <tr>
+                        <th className="text-left font-medium px-3 py-1.5">Record</th>
+                        <th className="text-left font-medium px-3 py-1.5">ID</th>
+                        <th className="text-left font-medium px-3 py-1.5">Short code</th>
+                        <th className="text-left font-medium px-3 py-1.5">Company</th>
+                        <th className="text-left font-medium px-3 py-1.5">Name</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {ap.releasedFrom.map((c) => (
+                        <tr
+                          key={`${c.source}-${c.id}`}
+                          className="border-t border-[hsl(var(--border))]"
+                        >
+                          <td className="px-3 py-1.5 whitespace-nowrap">
+                            {c.source === "corp" ? "corp empmaster_hdr" : "auth Field_Force_Users"}
+                          </td>
+                          <td className="px-3 py-1.5 font-mono">{c.id}</td>
+                          <td className="px-3 py-1.5 font-mono">{c.shortCode?.trim() || "—"}</td>
+                          <td className="px-3 py-1.5 font-mono">{c.companyCode?.trim() || "—"}</td>
+                          <td className="px-3 py-1.5">{c.name?.trim() || "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
             {ap.claimedBy.length > 0 ? (
               <>
                 <p className="text-xs text-amber-700 dark:text-amber-400">

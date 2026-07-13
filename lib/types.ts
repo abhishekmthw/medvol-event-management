@@ -567,6 +567,12 @@ export type CorrectionCognitoSyncResult = {
   /** Corp employees whose short code equals the Cognito user's CURRENT
    * (stale) short code — who the account currently claims to be. */
   claimedBy: CorrectionOldMobileHolder[];
+  /** OTHER corp/auth records storing this sub — stale claimants whose
+   * cognito_id is set to NULL as part of the run (corp is the source of
+   * truth: the account holds THIS employee's corp mobile). */
+  releasedFrom: CorrectionConflict[];
+  /** Rows whose cognito_id was actually NULLed (0 in preview). */
+  released: number;
   updated: boolean;
   preview: boolean;
 };

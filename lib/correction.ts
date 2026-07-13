@@ -273,6 +273,41 @@ async function findCorrectionConflicts(
   ];
 }
 
+/**
+ * Set cognito_id to NULL on the listed corp/auth records. Each UPDATE carries
+ * an `AND cognito_id = <sub>` predicate so a concurrently-corrected row is
+ * never clobbered. Returns the number of rows actually cleared.
+ */
+async function releaseSubFromRecords(
+  environment: Environment,
+  sub: string,
+  records: CorrectionConflict[],
+): Promise<number> {
+  const corpIds = records.filter((c) => c.source === "corp").map((c) => c.id);
+  const authIds = records.filter((c) => c.source === "auth").map((c) => c.id);
+  let cleared = 0;
+  if (corpIds.length > 0) {
+    const pool = getPool({ environment, service: "corp", instance: null });
+    const res = await pool.query(
+      `UPDATE public.empmaster_hdr SET cognito_id = NULL
+       WHERE empmaster_id = ANY($1::integer[]) AND cognito_id = $2`,
+      [corpIds, sub],
+    );
+    cleared += res.rowCount ?? 0;
+  }
+  if (authIds.length > 0) {
+    const pool = getAuthPool(environment);
+    const schema = authSchema(environment);
+    const res = await pool.query(
+      `UPDATE "${schema}"."Field_Force_Users" SET cognito_id = NULL
+       WHERE id = ANY($1::integer[]) AND cognito_id = $2`,
+      [authIds, sub],
+    );
+    cleared += res.rowCount ?? 0;
+  }
+  return cleared;
+}
+
 /* ---------------------- stored-sub owner resolution ---------------------- */
 
 /**
@@ -1171,28 +1206,7 @@ export async function releaseDuplicateCognitoId(
     };
   }
 
-  const corpIds = conflicts.filter((c) => c.source === "corp").map((c) => c.id);
-  const authIds = conflicts.filter((c) => c.source === "auth").map((c) => c.id);
-  let cleared = 0;
-  if (corpIds.length > 0) {
-    const pool = getPool({ environment, service: "corp", instance: null });
-    const res = await pool.query(
-      `UPDATE public.empmaster_hdr SET cognito_id = NULL
-       WHERE empmaster_id = ANY($1::integer[]) AND cognito_id = $2`,
-      [corpIds, sub],
-    );
-    cleared += res.rowCount ?? 0;
-  }
-  if (authIds.length > 0) {
-    const pool = getAuthPool(environment);
-    const schema = authSchema(environment);
-    const res = await pool.query(
-      `UPDATE "${schema}"."Field_Force_Users" SET cognito_id = NULL
-       WHERE id = ANY($1::integer[]) AND cognito_id = $2`,
-      [authIds, sub],
-    );
-    cleared += res.rowCount ?? 0;
-  }
+  const cleared = await releaseSubFromRecords(environment, sub, conflicts);
 
   return {
     ok: true,
@@ -1527,9 +1541,11 @@ export async function fixCognitoPhone(
  * number whose Cognito profile was never updated), sync those attributes from
  * corp. The identity evidence is twofold — the corp/auth DBs link to this sub
  * AND its phone equals the corp mobile — so the account is treated as this
- * employee's. Extra guards:
- *   - refused when the sub is also stored on any OTHER corp/auth record
- *     (ambiguous ownership — resolve the duplicate first);
+ * employee's. Corp resolves any apparent ambiguity:
+ *   - OTHER corp/auth records storing this sub are stale claimants — the
+ *     run sets their cognito_id to NULL first (previewed, conditional
+ *     `AND cognito_id = <sub>`), leaving this employee the sub's only
+ *     holder; analyze those employees' mobiles afterwards to relink them;
  *   - corp employees carrying the Cognito user's CURRENT short code are
  *     listed in the preview ("who the account claims to be") so the operator
  *     can verify that identity really moved off this number.
@@ -1548,6 +1564,8 @@ export async function syncCognitoAttributes(
     username: "",
     changes: [],
     claimedBy: [],
+    releasedFrom: [],
+    released: 0,
     updated: false,
     preview,
   });
@@ -1613,18 +1631,16 @@ export async function syncCognitoAttributes(
   const username = norm(owner.username);
   if (!username) return fail("The Cognito user has no username — cannot update.");
 
-  // Ambiguity guard: the sub must not be linked from any OTHER corp/auth row.
-  const conflicts = await findCorrectionConflicts(
+  // OTHER corp/auth records storing this sub are stale claimants — corp is
+  // the source of truth and the account holds THIS employee's corp mobile,
+  // so the run NULLs their cognito_id first (previewed below), leaving this
+  // employee the sub's only holder.
+  const releasedFrom = await findCorrectionConflicts(
     environment,
     sub,
     corp.empmaster_id,
     auth?.id ?? null,
   );
-  if (conflicts.length > 0) {
-    return fail(
-      `The sub is also stored on ${describeConflicts(conflicts)} — ownership is ambiguous; resolve those records before syncing Cognito attributes.`,
-    );
-  }
 
   // Only attributes that actually differ (same tolerant comparisons as the
   // analysis). Ucode is written uppercase — Cognito's convention.
@@ -1686,15 +1702,26 @@ export async function syncCognitoAttributes(
   if (preview) {
     return {
       ok: true,
-      message: `Would update ${changes.map((c) => c.label.toLowerCase()).join(", ")} on Cognito user ${username} (sub ${sub}) from corp — the account holds the corp mobile ${mobile10} and is linked from ${owners[0].sources.join(" + ")}.`,
+      message: `Would update ${changes.map((c) => c.label.toLowerCase()).join(", ")} on Cognito user ${username} (sub ${sub}) from corp — the account holds the corp mobile ${mobile10} and is linked from ${owners[0].sources.join(" + ")}.${releasedFrom.length > 0 ? ` The sub is also stored on ${describeConflicts(releasedFrom)} — those stale links will be released (cognito_id set to NULL) in the same run.` : ""}`,
       sub,
       username,
       changes,
       claimedBy,
+      releasedFrom,
+      released: 0,
       updated: false,
       preview: true,
     };
   }
+
+  // Release the stale links first: if the Cognito write then fails, a
+  // re-analyze still offers this sync (the attributes are unchanged and the
+  // duplicates are gone); the reverse order could leave a relabeled account
+  // whose sub is still duplicated across records.
+  const released =
+    releasedFrom.length > 0
+      ? await releaseSubFromRecords(environment, sub, releasedFrom)
+      : 0;
 
   const attrs: Record<string, string> = {};
   for (const c of changes) attrs[c.attribute] = c.after;
@@ -1702,11 +1729,13 @@ export async function syncCognitoAttributes(
 
   return {
     ok: true,
-    message: `Updated ${changes.map((c) => c.label.toLowerCase()).join(", ")} on the Cognito user of ${norm(corp.emp_shortcode)}. Re-check — the fix action can then align corp/auth cognito_id if still needed.`,
+    message: `Updated ${changes.map((c) => c.label.toLowerCase()).join(", ")} on the Cognito user of ${norm(corp.emp_shortcode)}.${released > 0 ? ` Released the sub from ${released} other record${released === 1 ? "" : "s"} — analyze those employees' mobiles to relink them to their own accounts.` : ""} Re-check — the fix action can then align corp/auth cognito_id if still needed.`,
     sub,
     username,
     changes,
     claimedBy,
+    releasedFrom,
+    released,
     updated: true,
     preview: false,
   };
