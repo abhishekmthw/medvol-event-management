@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { syncCognitoAttributes } from "@/lib/correction";
+import { reassignCognitoOwner } from "@/lib/correction";
 import type { Environment } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -10,7 +10,7 @@ const ALLOWED_ENVS: Environment[] = ["prod", "stage"];
 type Body = {
   environment?: Environment;
   empmasterId?: string;
-  /** true → report the attribute before/after without writing. */
+  /** true → report the planned repairs without writing. */
   preview?: boolean;
 };
 
@@ -34,11 +34,11 @@ export async function POST(req: Request) {
   }
 
   try {
-    const result = await syncCognitoAttributes(environment, empmasterId, preview);
+    const result = await reassignCognitoOwner(environment, empmasterId, preview);
     return NextResponse.json(result);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    console.error(`[correction/sync-cognito-attrs ${environment} ${empmasterId}]`, msg);
+    console.error(`[correction/reassign-owner ${environment} ${empmasterId}]`, msg);
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }

@@ -447,9 +447,12 @@ export type CorrectionEmployee = {
     /** The stored sub's Cognito owner matches the corp short code but holds a
      * different mobile → offer to push the corp mobile to Cognito. */
     fixCognitoPhone: boolean;
-    /** The stored sub's Cognito owner holds the corp mobile but its short
-     * code / name / ucode attributes are stale → offer to sync them from corp. */
-    syncCognitoAttributes: boolean;
+    /** The stored sub's Cognito owner holds THIS employee's corp mobile but
+     * its short code identifies a different employee → offer to return the
+     * account to its short-code owner (fix its Cognito mobile from the
+     * owner's corp record, write its sub to the owner's corp/auth, clear the
+     * stale link here). Cognito identity attributes are never rewritten. */
+    reassignCognitoOwner: boolean;
   };
   /** Conditions that prevent automatic correction (need manual attention). */
   blockers: string[];
@@ -549,30 +552,51 @@ export type CorrectionPhoneFixResult = {
   preview: boolean;
 };
 
-/** One Cognito attribute the corp-sync would change (before → after). */
-export type CorrectionCognitoAttrChange = {
-  attribute: string;
-  label: string;
+/** One cognito_id write the reassign performs on the OWNER's records. */
+export type CorrectionReassignWrite = {
+  source: "corp" | "auth";
+  /** empmaster_id (corp) or Field_Force_Users.id (auth). */
+  id: string;
   before: string | null;
-  after: string;
+  /** false when the record already stores the sub. */
+  needsUpdate: boolean;
 };
 
-export type CorrectionCognitoSyncResult = {
+/**
+ * "Return account to its short-code owner": the Cognito account linked from
+ * THIS employee's records is labeled with a different short code — per that
+ * short code (the identity anchor; never rewritten) it belongs to another
+ * corp employee. One run repairs both users: the account's Cognito mobile is
+ * set to the OWNER's corp mobile (the only Cognito write), its sub is written
+ * to the owner's corp/auth records, and the stale link on THIS employee is
+ * NULLed.
+ */
+export type CorrectionReassignResult = {
   ok: boolean;
   message: string;
-  /** The Cognito user being updated. */
+  /** The Cognito account being returned to its owner. */
   sub: string;
   username: string;
-  changes: CorrectionCognitoAttrChange[];
-  /** Corp employees whose short code equals the Cognito user's CURRENT
-   * (stale) short code — who the account currently claims to be. */
-  claimedBy: CorrectionOldMobileHolder[];
-  /** OTHER corp/auth records storing this sub — stale claimants whose
-   * cognito_id is set to NULL as part of the run (corp is the source of
-   * truth: the account holds THIS employee's corp mobile). */
-  releasedFrom: CorrectionConflict[];
-  /** Rows whose cognito_id was actually NULLed (0 in preview). */
-  released: number;
+  /** The owner per the account's custom:emp_short_code. */
+  owner: {
+    shortCode: string;
+    /** Name on the Cognito account (display only — never written). */
+    cognitoName: string | null;
+    corpId: string;
+    companyCode: string | null;
+    corpName: string | null;
+    /** Owner's corp mobile, 10-digit — the value pushed to Cognito. */
+    corpMobile: string;
+    authId: string | null;
+  } | null;
+  /** Cognito phone change (null when already equal to the owner's corp mobile). */
+  phoneChange: { before: string | null; after: string } | null;
+  /** cognito_id writes on the owner's corp/auth records. */
+  writes: CorrectionReassignWrite[];
+  /** THIS employee's records whose stale link to the sub is NULLed. */
+  clearedFrom: CorrectionConflict[];
+  /** Rows actually NULLed (0 in preview). */
+  cleared: number;
   updated: boolean;
   preview: boolean;
 };

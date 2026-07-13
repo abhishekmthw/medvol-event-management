@@ -17,7 +17,7 @@ import { displayMobile10 } from "@/lib/format";
 import type {
   CorrectionAnalyzeResult,
   CorrectionClearResult,
-  CorrectionCognitoSyncResult,
+  CorrectionReassignResult,
   CorrectionEmployee,
   CorrectionField,
   CorrectionFixResult,
@@ -48,7 +48,7 @@ type ActionKind =
   | "release"
   | "clear"
   | "phone"
-  | "attrs";
+  | "reassign";
 
 type ActionState = {
   kind: ActionKind;
@@ -67,8 +67,8 @@ type ActionState = {
   clearResult?: CorrectionClearResult;
   phonePreview?: CorrectionPhoneFixResult;
   phoneResult?: CorrectionPhoneFixResult;
-  attrsPreview?: CorrectionCognitoSyncResult;
-  attrsResult?: CorrectionCognitoSyncResult;
+  reassignPreview?: CorrectionReassignResult;
+  reassignResult?: CorrectionReassignResult;
   error?: string;
 };
 
@@ -507,27 +507,27 @@ export function DataCorrectionCard({
     }
   }
 
-  /* ------------------- sync Cognito details from corp ------------------- */
+  /* ----------------- return the account to its owner ----------------- */
 
-  async function startAttrsSync(emp: CorrectionEmployee) {
+  async function startReassign(emp: CorrectionEmployee) {
     setPollNote(null);
     setAction({
-      kind: "attrs",
+      kind: "reassign",
       empmasterId: emp.empmasterId,
       shortCode: emp.shortCode,
       phase: "previewing",
     });
     try {
-      const preview = await post<CorrectionCognitoSyncResult>(
-        "/api/auth-comparison/correction/sync-cognito-attrs",
+      const preview = await post<CorrectionReassignResult>(
+        "/api/auth-comparison/correction/reassign-owner",
         { environment, empmasterId: emp.empmasterId, preview: true },
       );
       if (preview === null) return;
-      if (!preview.ok || preview.changes.length === 0) {
+      if (!preview.ok || preview.owner === null) {
         setAction((a) => a && { ...a, phase: "done", error: preview.message });
         return;
       }
-      setAction((a) => a && { ...a, phase: "confirm", attrsPreview: preview });
+      setAction((a) => a && { ...a, phase: "confirm", reassignPreview: preview });
     } catch (e) {
       setAction(
         (a) =>
@@ -540,16 +540,16 @@ export function DataCorrectionCard({
     }
   }
 
-  async function confirmAttrsSync() {
-    if (!action || action.kind !== "attrs") return;
+  async function confirmReassign() {
+    if (!action || action.kind !== "reassign") return;
     setAction({ ...action, phase: "running" });
     try {
-      const run = await post<CorrectionCognitoSyncResult>(
-        "/api/auth-comparison/correction/sync-cognito-attrs",
+      const run = await post<CorrectionReassignResult>(
+        "/api/auth-comparison/correction/reassign-owner",
         { environment, empmasterId: action.empmasterId, preview: false },
       );
       if (run === null) return;
-      setAction((a) => a && { ...a, phase: "done", attrsResult: run });
+      setAction((a) => a && { ...a, phase: "done", reassignResult: run });
       await analyze(true);
     } catch (e) {
       setAction(
@@ -698,7 +698,7 @@ export function DataCorrectionCard({
               onReleaseDuplicate={() => startRelease(emp)}
               onClearWrong={() => startClear(emp)}
               onFixPhone={() => startPhoneFix(emp)}
-              onSyncAttrs={() => startAttrsSync(emp)}
+              onReassignOwner={() => startReassign(emp)}
             />
           ))}
         </div>
@@ -724,7 +724,7 @@ export function DataCorrectionCard({
                       ? confirmClear
                       : action.kind === "phone"
                         ? confirmPhoneFix
-                        : confirmAttrsSync
+                        : confirmReassign
           }
         />
       )}
@@ -745,7 +745,7 @@ function EmployeePanel({
   onReleaseDuplicate,
   onClearWrong,
   onFixPhone,
-  onSyncAttrs,
+  onReassignOwner,
 }: {
   emp: CorrectionEmployee;
   isProd: boolean;
@@ -757,7 +757,7 @@ function EmployeePanel({
   onReleaseDuplicate: () => void;
   onClearWrong: () => void;
   onFixPhone: () => void;
-  onSyncAttrs: () => void;
+  onReassignOwner: () => void;
 }) {
   const working = action?.phase === "previewing" || action?.phase === "running";
   return (
@@ -871,7 +871,7 @@ function EmployeePanel({
               (action.kind === "release" && !action.releaseResult?.ok) ||
               (action.kind === "clear" && !action.clearResult?.ok) ||
               (action.kind === "phone" && !action.phoneResult?.ok) ||
-              (action.kind === "attrs" && !action.attrsResult?.ok)
+              (action.kind === "reassign" && !action.reassignResult?.ok)
               ? "border border-[hsl(var(--danger))]/40 bg-[hsl(var(--danger))]/10 text-[hsl(var(--danger))]"
               : "border border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400",
           )}
@@ -891,7 +891,7 @@ function EmployeePanel({
                         ? action.clearResult?.message
                         : action.kind === "phone"
                           ? action.phoneResult?.message
-                          : action.attrsResult?.message)}
+                          : action.reassignResult?.message)}
           </span>
         </div>
       )}
@@ -962,17 +962,17 @@ function EmployeePanel({
             Update Cognito mobile from corp
           </button>
         )}
-        {emp.actions.syncCognitoAttributes && (
+        {emp.actions.reassignCognitoOwner && (
           <button
             type="button"
             className={isProd ? "btn-danger" : "btn-primary"}
-            onClick={onSyncAttrs}
+            onClick={onReassignOwner}
             disabled={busy}
           >
-            {working && action?.kind === "attrs" ? (
+            {working && action?.kind === "reassign" ? (
               <Loader2 className="h-4 w-4 animate-spin" />
             ) : null}
-            Sync Cognito details from corp
+            Return account to its owner
           </button>
         )}
         {emp.actions.fixCognitoId && (
@@ -1154,14 +1154,14 @@ function ConfirmModal({
   const isRelease = action.kind === "release";
   const isClear = action.kind === "clear";
   const isPhone = action.kind === "phone";
-  const isAttrs = action.kind === "attrs";
+  const isReassign = action.kind === "reassign";
   const rp = action.replayPreview;
   const fp = action.fixPreview;
   const sp = action.syncPreview;
   const lp = action.releasePreview;
   const cp = action.clearPreview;
   const pp = action.phonePreview;
-  const ap = action.attrsPreview;
+  const ap = action.reassignPreview;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
       <div className="card w-full max-w-lg p-5 space-y-4 max-h-[85vh] overflow-y-auto">
@@ -1183,8 +1183,8 @@ function ConfirmModal({
                     ? `Clear wrong cognito_id — ${action.shortCode}`
                     : isPhone
                       ? `Update Cognito mobile — ${action.shortCode}`
-                      : isAttrs
-                        ? `Sync Cognito details — ${action.shortCode}`
+                      : isReassign
+                        ? `Return account to its owner — ${action.shortCode}`
                         : `Fix cognito_id — ${action.shortCode}`}
           </h3>
           <span
@@ -1438,57 +1438,111 @@ function ConfirmModal({
           </>
         )}
 
-        {isAttrs && ap && (
+        {isReassign && ap && ap.owner && (
           <>
             <p className="text-xs text-[hsl(var(--muted-foreground))]">
-              This Cognito account holds the <b>corp mobile</b> of{" "}
-              <b>{action.shortCode}</b> and is linked from corp/auth by its
-              cognito_id, but its profile attributes still identify a
-              different employee. They will be overwritten with the corp
-              (source of truth) values — this is a <b>write to Cognito</b>.
+              This Cognito account holds <b>{action.shortCode}</b>&apos;s corp
+              mobile, but its short code says it belongs to{" "}
+              <b>{ap.owner.shortCode}</b> ({ap.owner.corpName?.trim() || "—"}).
+              The short code is the identity anchor — Cognito attributes are
+              never rewritten. This run returns the account to its owner:
             </p>
             <div className="rounded-lg border border-[hsl(var(--border))] text-xs divide-y divide-[hsl(var(--border))]">
               <div className="px-3 py-2 flex items-baseline gap-2">
-                <span className="w-24 shrink-0 text-[hsl(var(--muted-foreground))]">
+                <span className="w-28 shrink-0 text-[hsl(var(--muted-foreground))]">
                   Cognito sub
                 </span>
                 <span className="font-mono break-all">{ap.sub}</span>
               </div>
+              <div className="px-3 py-2 flex items-baseline gap-2">
+                <span className="w-28 shrink-0 text-[hsl(var(--muted-foreground))]">
+                  Owner (corp)
+                </span>
+                <span className="break-all">
+                  <span className="font-mono">{ap.owner.shortCode}</span>
+                  {" · "}
+                  {ap.owner.corpName?.trim() || "—"} {" · empmaster "}
+                  <span className="font-mono">{ap.owner.corpId}</span>
+                  {" · company "}
+                  <span className="font-mono">{ap.owner.companyCode?.trim() || "—"}</span>
+                </span>
+              </div>
+              <div className="px-3 py-2 flex items-baseline gap-2">
+                <span className="w-28 shrink-0 text-[hsl(var(--muted-foreground))]">
+                  Cognito mobile
+                </span>
+                {ap.phoneChange ? (
+                  <span className="font-mono">
+                    {ap.phoneChange.before ?? "—"}{" "}
+                    <span className="text-[hsl(var(--muted-foreground))]">→</span>{" "}
+                    <span className="text-emerald-700 dark:text-emerald-400">
+                      {ap.phoneChange.after}
+                    </span>{" "}
+                    <span className="text-[hsl(var(--muted-foreground))]">
+                      (owner&apos;s corp mobile — the only Cognito write)
+                    </span>
+                  </span>
+                ) : (
+                  <span className="font-mono">
+                    {ap.owner.corpMobile}{" "}
+                    <span className="pill bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
+                      already correct
+                    </span>
+                  </span>
+                )}
+              </div>
             </div>
+            <p className="text-xs text-[hsl(var(--muted-foreground))]">
+              Based on the short code in Cognito, the cognito_id is then
+              written to the owner&apos;s records:
+            </p>
             <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
               <table className="w-full text-xs">
                 <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
                   <tr>
-                    <th className="text-left font-medium px-3 py-1.5">Attribute</th>
-                    <th className="text-left font-medium px-3 py-1.5">Cognito (before)</th>
-                    <th className="text-left font-medium px-3 py-1.5">Corp (after)</th>
+                    <th className="text-left font-medium px-3 py-1.5">Owner record</th>
+                    <th className="text-left font-medium px-3 py-1.5">ID</th>
+                    <th className="text-left font-medium px-3 py-1.5">cognito_id before</th>
+                    <th className="text-left font-medium px-3 py-1.5">After</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {ap.changes.map((c) => (
-                    <tr key={c.attribute} className="border-t border-[hsl(var(--border))]">
-                      <td className="px-3 py-1.5 font-medium whitespace-nowrap">{c.label}</td>
-                      <td className="px-3 py-1.5 font-mono break-all">
-                        {c.before?.trim() || "—"}
+                  {ap.writes.map((w) => (
+                    <tr key={`${w.source}-${w.id}`} className="border-t border-[hsl(var(--border))]">
+                      <td className="px-3 py-1.5 whitespace-nowrap">
+                        {w.source === "corp" ? "corp empmaster_hdr" : "auth Field_Force_Users"}
                       </td>
-                      <td className="px-3 py-1.5 font-mono break-all text-emerald-700 dark:text-emerald-400">
-                        {c.after}
+                      <td className="px-3 py-1.5 font-mono">{w.id}</td>
+                      <td className="px-3 py-1.5 font-mono break-all">{w.before?.trim() || "—"}</td>
+                      <td className="px-3 py-1.5">
+                        {w.needsUpdate ? (
+                          <span className="font-mono break-all text-emerald-700 dark:text-emerald-400">
+                            {ap.sub}
+                          </span>
+                        ) : (
+                          <span className="pill bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
+                            already correct
+                          </span>
+                        )}
                       </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
             </div>
-            {ap.releasedFrom.length > 0 && (
+            {ap.owner.authId === null && (
+              <p className="text-[11px] text-amber-700 dark:text-amber-400">
+                The owner has no auth record — only the corp side receives the
+                cognito_id; create them in auth via their own analysis if
+                needed.
+              </p>
+            )}
+            {ap.clearedFrom.length > 0 && (
               <>
                 <p className="text-xs text-red-600 dark:text-red-400">
-                  The sub is also stored on the record
-                  {ap.releasedFrom.length === 1 ? "" : "s"} below. Corp is the
-                  source of truth and this account holds{" "}
-                  <b>{action.shortCode}</b>&apos;s corp mobile, so those are
-                  stale links — their <b>cognito_id will be set to NULL</b> in
-                  the same run. Analyze those employees&apos; mobiles
-                  afterwards to relink them to their own accounts:
+                  The stale link on <b>{action.shortCode}</b>&apos;s record
+                  {ap.clearedFrom.length === 1 ? "" : "s"} below is set to{" "}
+                  <b>NULL</b> in the same run:
                 </p>
                 <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
                   <table className="w-full text-xs">
@@ -1502,7 +1556,7 @@ function ConfirmModal({
                       </tr>
                     </thead>
                     <tbody>
-                      {ap.releasedFrom.map((c) => (
+                      {ap.clearedFrom.map((c) => (
                         <tr
                           key={`${c.source}-${c.id}`}
                           className="border-t border-[hsl(var(--border))]"
@@ -1521,45 +1575,10 @@ function ConfirmModal({
                 </div>
               </>
             )}
-            {ap.claimedBy.length > 0 ? (
-              <>
-                <p className="text-xs text-amber-700 dark:text-amber-400">
-                  The account currently claims to be short code{" "}
-                  <b>{ap.changes.find((c) => c.attribute === "custom:emp_short_code")?.before?.trim() || "—"}</b>
-                  , which exists in corp as the record
-                  {ap.claimedBy.length === 1 ? "" : "s"} below — verify that
-                  employee no longer uses this number (analyze their mobile if
-                  in doubt) before confirming:
-                </p>
-                <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
-                  <table className="w-full text-xs">
-                    <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
-                      <tr>
-                        <th className="text-left font-medium px-3 py-1.5">Record</th>
-                        <th className="text-left font-medium px-3 py-1.5">Short code</th>
-                        <th className="text-left font-medium px-3 py-1.5">Company</th>
-                        <th className="text-left font-medium px-3 py-1.5">Name</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {ap.claimedBy.map((h) => (
-                        <tr key={h.id} className="border-t border-[hsl(var(--border))]">
-                          <td className="px-3 py-1.5 font-mono">{h.id}</td>
-                          <td className="px-3 py-1.5 font-mono">{h.shortCode?.trim() || "—"}</td>
-                          <td className="px-3 py-1.5 font-mono">{h.companyCode?.trim() || "—"}</td>
-                          <td className="px-3 py-1.5">{h.name?.trim() || "—"}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </>
-            ) : (
-              <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
-                No corp employee carries the account&apos;s current short code —
-                the stale identity has no corp record behind it.
-              </p>
-            )}
+            <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
+              After the run, re-check this employee and analyze{" "}
+              {ap.owner.corpMobile} to verify the owner.
+            </p>
           </>
         )}
 
@@ -1622,9 +1641,11 @@ function ConfirmModal({
                   ? "Confirm release"
                   : isClear
                     ? "Confirm clear"
-                    : isPhone || isAttrs
+                    : isPhone
                       ? "Confirm Cognito update"
-                      : "Confirm update"}
+                      : isReassign
+                        ? "Confirm reassign"
+                        : "Confirm update"}
           </button>
         </div>
       </div>
