@@ -16,13 +16,9 @@ import {
 import { displayMobile10 } from "@/lib/format";
 import type {
   CorrectionAnalyzeResult,
-  CorrectionClearResult,
-  CorrectionReassignResult,
   CorrectionEmployee,
   CorrectionField,
-  CorrectionFixResult,
-  CorrectionPhoneFixResult,
-  CorrectionReleaseResult,
+  CorrectionRepairResult,
   CorrectionReplayResult,
   CorrectionSyncResult,
   Environment,
@@ -33,22 +29,19 @@ import type {
  *
  * Corp-driven and mobile-keyed: enter a mobile → the corp employee(s) holding
  * it are analyzed against auth and Cognito (corp = truth for short code /
- * mobile / name / ucode; Cognito = truth for cognito_id). Two corrective
+ * mobile / name / ucode; Cognito = truth for cognito_id). Three corrective
  * actions, each preview-then-confirm:
  *   1. Missing in auth → replay the employee's corp event stream onto the V1
  *      auth SQS queue, then poll until the user appears in auth.
- *   2. Fix cognito_id → write the live Cognito sub (matched by corp mobile +
- *      short code) into corp and auth.
+ *   2. Sync auth with corp → overwrite drifted auth name / mobile / ucode.
+ *   3. Reassign / repair cognito_id → the single step for EVERY cognito_id
+ *      entanglement: discovers the two users whose details criss-crossed
+ *      (via cognito_id or mobile across all three datasources) and repairs
+ *      both in one confirmed run; participants missing in auth get a create
+ *      button inside the modal first.
  */
 
-type ActionKind =
-  | "replay"
-  | "fix"
-  | "sync"
-  | "release"
-  | "clear"
-  | "phone"
-  | "reassign";
+type ActionKind = "replay" | "sync" | "repair";
 
 type ActionState = {
   kind: ActionKind;
@@ -57,18 +50,12 @@ type ActionState = {
   phase: "previewing" | "confirm" | "running" | "done";
   replayPreview?: CorrectionReplayResult;
   replayResult?: CorrectionReplayResult;
-  fixPreview?: CorrectionFixResult;
-  fixResult?: CorrectionFixResult;
   syncPreview?: CorrectionSyncResult;
   syncResult?: CorrectionSyncResult;
-  releasePreview?: CorrectionReleaseResult;
-  releaseResult?: CorrectionReleaseResult;
-  clearPreview?: CorrectionClearResult;
-  clearResult?: CorrectionClearResult;
-  phonePreview?: CorrectionPhoneFixResult;
-  phoneResult?: CorrectionPhoneFixResult;
-  reassignPreview?: CorrectionReassignResult;
-  reassignResult?: CorrectionReassignResult;
+  repairPreview?: CorrectionRepairResult;
+  repairResult?: CorrectionRepairResult;
+  /** empmasterId of the participant being created in auth from the repair modal. */
+  creating?: string;
   error?: string;
 };
 
@@ -227,62 +214,6 @@ export function DataCorrectionCard({
     }
   }
 
-  /* --------------------------- fix cognito_id --------------------------- */
-
-  async function startFix(emp: CorrectionEmployee) {
-    setPollNote(null);
-    setAction({
-      kind: "fix",
-      empmasterId: emp.empmasterId,
-      shortCode: emp.shortCode,
-      phase: "previewing",
-    });
-    try {
-      const preview = await post<CorrectionFixResult>(
-        "/api/auth-comparison/correction/fix-cognito",
-        { environment, empmasterId: emp.empmasterId, preview: true },
-      );
-      if (preview === null) return;
-      if (!preview.ok || (!preview.corp.needsUpdate && !preview.auth.needsUpdate)) {
-        setAction((a) => a && { ...a, phase: "done", error: preview.message });
-        return;
-      }
-      setAction((a) => a && { ...a, phase: "confirm", fixPreview: preview });
-    } catch (e) {
-      setAction(
-        (a) =>
-          a && {
-            ...a,
-            phase: "done",
-            error: e instanceof Error ? e.message : String(e),
-          },
-      );
-    }
-  }
-
-  async function confirmFix() {
-    if (!action || action.kind !== "fix") return;
-    setAction({ ...action, phase: "running" });
-    try {
-      const run = await post<CorrectionFixResult>(
-        "/api/auth-comparison/correction/fix-cognito",
-        { environment, empmasterId: action.empmasterId, preview: false },
-      );
-      if (run === null) return;
-      setAction((a) => a && { ...a, phase: "done", fixResult: run });
-      await analyze(true);
-    } catch (e) {
-      setAction(
-        (a) =>
-          a && {
-            ...a,
-            phase: "done",
-            error: e instanceof Error ? e.message : String(e),
-          },
-      );
-    }
-  }
-
   /* --------------------------- sync auth from corp --------------------------- */
 
   async function startSync(emp: CorrectionEmployee) {
@@ -339,131 +270,19 @@ export function DataCorrectionCard({
     }
   }
 
-  /* --------------------- release duplicate cognito_id --------------------- */
+  /* --------------------- unified cognito_id repair --------------------- */
 
-  async function startRelease(emp: CorrectionEmployee) {
+  async function startRepair(emp: CorrectionEmployee) {
     setPollNote(null);
     setAction({
-      kind: "release",
+      kind: "repair",
       empmasterId: emp.empmasterId,
       shortCode: emp.shortCode,
       phase: "previewing",
     });
     try {
-      const preview = await post<CorrectionReleaseResult>(
-        "/api/auth-comparison/correction/release-cognito",
-        { environment, empmasterId: emp.empmasterId, preview: true },
-      );
-      if (preview === null) return;
-      if (!preview.ok || preview.conflicts.length === 0) {
-        setAction((a) => a && { ...a, phase: "done", error: preview.message });
-        return;
-      }
-      setAction((a) => a && { ...a, phase: "confirm", releasePreview: preview });
-    } catch (e) {
-      setAction(
-        (a) =>
-          a && {
-            ...a,
-            phase: "done",
-            error: e instanceof Error ? e.message : String(e),
-          },
-      );
-    }
-  }
-
-  async function confirmRelease() {
-    if (!action || action.kind !== "release") return;
-    setAction({ ...action, phase: "running" });
-    try {
-      const run = await post<CorrectionReleaseResult>(
-        "/api/auth-comparison/correction/release-cognito",
-        { environment, empmasterId: action.empmasterId, preview: false },
-      );
-      if (run === null) return;
-      setAction((a) => a && { ...a, phase: "done", releaseResult: run });
-      await analyze(true);
-    } catch (e) {
-      setAction(
-        (a) =>
-          a && {
-            ...a,
-            phase: "done",
-            error: e instanceof Error ? e.message : String(e),
-          },
-      );
-    }
-  }
-
-  /* ----------------------- clear wrong cognito_id ----------------------- */
-
-  async function startClear(emp: CorrectionEmployee) {
-    setPollNote(null);
-    setAction({
-      kind: "clear",
-      empmasterId: emp.empmasterId,
-      shortCode: emp.shortCode,
-      phase: "previewing",
-    });
-    try {
-      const preview = await post<CorrectionClearResult>(
-        "/api/auth-comparison/correction/clear-cognito",
-        { environment, empmasterId: emp.empmasterId, preview: true },
-      );
-      if (preview === null) return;
-      if (!preview.ok || preview.targets.length === 0) {
-        setAction((a) => a && { ...a, phase: "done", error: preview.message });
-        return;
-      }
-      setAction((a) => a && { ...a, phase: "confirm", clearPreview: preview });
-    } catch (e) {
-      setAction(
-        (a) =>
-          a && {
-            ...a,
-            phase: "done",
-            error: e instanceof Error ? e.message : String(e),
-          },
-      );
-    }
-  }
-
-  async function confirmClear() {
-    if (!action || action.kind !== "clear") return;
-    setAction({ ...action, phase: "running" });
-    try {
-      const run = await post<CorrectionClearResult>(
-        "/api/auth-comparison/correction/clear-cognito",
-        { environment, empmasterId: action.empmasterId, preview: false },
-      );
-      if (run === null) return;
-      setAction((a) => a && { ...a, phase: "done", clearResult: run });
-      await analyze(true);
-    } catch (e) {
-      setAction(
-        (a) =>
-          a && {
-            ...a,
-            phase: "done",
-            error: e instanceof Error ? e.message : String(e),
-          },
-      );
-    }
-  }
-
-  /* --------------------- update Cognito mobile from corp --------------------- */
-
-  async function startPhoneFix(emp: CorrectionEmployee) {
-    setPollNote(null);
-    setAction({
-      kind: "phone",
-      empmasterId: emp.empmasterId,
-      shortCode: emp.shortCode,
-      phase: "previewing",
-    });
-    try {
-      const preview = await post<CorrectionPhoneFixResult>(
-        "/api/auth-comparison/correction/fix-cognito-phone",
+      const preview = await post<CorrectionRepairResult>(
+        "/api/auth-comparison/correction/repair",
         { environment, empmasterId: emp.empmasterId, preview: true },
       );
       if (preview === null) return;
@@ -471,7 +290,7 @@ export function DataCorrectionCard({
         setAction((a) => a && { ...a, phase: "done", error: preview.message });
         return;
       }
-      setAction((a) => a && { ...a, phase: "confirm", phonePreview: preview });
+      setAction((a) => a && { ...a, phase: "confirm", repairPreview: preview });
     } catch (e) {
       setAction(
         (a) =>
@@ -484,16 +303,16 @@ export function DataCorrectionCard({
     }
   }
 
-  async function confirmPhoneFix() {
-    if (!action || action.kind !== "phone") return;
+  async function confirmRepair() {
+    if (!action || action.kind !== "repair") return;
     setAction({ ...action, phase: "running" });
     try {
-      const run = await post<CorrectionPhoneFixResult>(
-        "/api/auth-comparison/correction/fix-cognito-phone",
+      const run = await post<CorrectionRepairResult>(
+        "/api/auth-comparison/correction/repair",
         { environment, empmasterId: action.empmasterId, preview: false },
       );
       if (run === null) return;
-      setAction((a) => a && { ...a, phase: "done", phoneResult: run });
+      setAction((a) => a && { ...a, phase: "done", repairResult: run });
       await analyze(true);
     } catch (e) {
       setAction(
@@ -507,59 +326,60 @@ export function DataCorrectionCard({
     }
   }
 
-  /* ----------------- return the account to its owner ----------------- */
-
-  async function startReassign(emp: CorrectionEmployee) {
-    setPollNote(null);
-    setAction({
-      kind: "reassign",
-      empmasterId: emp.empmasterId,
-      shortCode: emp.shortCode,
-      phase: "previewing",
-    });
+  /**
+   * From the repair modal: create a missing-in-auth participant by replaying
+   * their corp event stream, then poll the repair preview until the auth
+   * consumer has created the record — the missing-in-auth blocker lifts and
+   * the confirm unlocks without leaving the modal.
+   */
+  async function createParticipantInAuth(participantId: string) {
+    if (!action || action.kind !== "repair") return;
+    const baseId = action.empmasterId;
+    const gen = genRef.current;
+    setAction((a) => a && { ...a, creating: participantId, error: undefined });
     try {
-      const preview = await post<CorrectionReassignResult>(
-        "/api/auth-comparison/correction/reassign-owner",
-        { environment, empmasterId: emp.empmasterId, preview: true },
+      const run = await post<CorrectionReplayResult>(
+        "/api/auth-comparison/correction/replay",
+        { environment, empmasterId: participantId, preview: false },
       );
-      if (preview === null) return;
-      if (!preview.ok || preview.owner === null) {
-        setAction((a) => a && { ...a, phase: "done", error: preview.message });
+      if (run === null || gen !== genRef.current) return;
+      if (!run.ok) {
+        setAction((a) => a && { ...a, error: run.message });
         return;
       }
-      setAction((a) => a && { ...a, phase: "confirm", reassignPreview: preview });
-    } catch (e) {
+      for (let i = 1; i <= POLL_ATTEMPTS; i++) {
+        await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+        if (gen !== genRef.current) return;
+        const p = await post<CorrectionRepairResult>(
+          "/api/auth-comparison/correction/repair",
+          { environment, empmasterId: baseId, preview: true },
+        );
+        if (p === null || gen !== genRef.current) return;
+        setAction((a) =>
+          a && a.kind === "repair" && a.phase === "confirm"
+            ? { ...a, repairPreview: p }
+            : a,
+        );
+        const part = p.participants.find((x) => x.empmasterId === participantId);
+        if (part && !part.missingInAuth) return;
+      }
       setAction(
         (a) =>
           a && {
             ...a,
-            phase: "done",
-            error: e instanceof Error ? e.message : String(e),
+            error:
+              "The auth consumer has not created the record yet — it may still be processing. Cancel and re-open the repair in a moment (do not resend the events).",
           },
       );
-    }
-  }
-
-  async function confirmReassign() {
-    if (!action || action.kind !== "reassign") return;
-    setAction({ ...action, phase: "running" });
-    try {
-      const run = await post<CorrectionReassignResult>(
-        "/api/auth-comparison/correction/reassign-owner",
-        { environment, empmasterId: action.empmasterId, preview: false },
-      );
-      if (run === null) return;
-      setAction((a) => a && { ...a, phase: "done", reassignResult: run });
-      await analyze(true);
     } catch (e) {
       setAction(
         (a) =>
-          a && {
-            ...a,
-            phase: "done",
-            error: e instanceof Error ? e.message : String(e),
-          },
+          a && { ...a, error: e instanceof Error ? e.message : String(e) },
       );
+    } finally {
+      if (gen === genRef.current) {
+        setAction((a) => a && { ...a, creating: undefined });
+      }
     }
   }
 
@@ -597,9 +417,11 @@ export function DataCorrectionCard({
         in auth, its corp event stream (<code>employee_&lt;empmaster id&gt;</code>)
         can be replayed onto the auth queue to re-create it; if it exists but
         its name / mobile / ucode drifted, they can be synced onto the auth
-        record from corp; and the live Cognito user (matched by corp mobile +
-        short code) supplies the correct <b>cognito_id</b>, which is then
-        written to corp and auth. Every action previews first and asks for
+        record from corp; and ANY <b>cognito_id</b> entanglement — mismatched,
+        duplicated, stale or criss-crossed with another user — is fixed by the
+        single <b>Reassign / repair</b> step, which finds both intertwined
+        users (via cognito_id or mobile across all three datasources) and
+        updates them together. Every action previews first and asks for
         confirmation.
       </p>
 
@@ -693,12 +515,8 @@ export function DataCorrectionCard({
               busy={Boolean(busy)}
               action={action?.empmasterId === emp.empmasterId ? action : null}
               onCreateInAuth={() => startReplay(emp)}
-              onFixCognito={() => startFix(emp)}
               onSyncAuth={() => startSync(emp)}
-              onReleaseDuplicate={() => startRelease(emp)}
-              onClearWrong={() => startClear(emp)}
-              onFixPhone={() => startPhoneFix(emp)}
-              onReassignOwner={() => startReassign(emp)}
+              onRepair={() => startRepair(emp)}
             />
           ))}
         </div>
@@ -714,18 +532,11 @@ export function DataCorrectionCard({
           onConfirm={
             action.kind === "replay"
               ? confirmReplay
-              : action.kind === "fix"
-                ? confirmFix
-                : action.kind === "sync"
-                  ? confirmSync
-                  : action.kind === "release"
-                    ? confirmRelease
-                    : action.kind === "clear"
-                      ? confirmClear
-                      : action.kind === "phone"
-                        ? confirmPhoneFix
-                        : confirmReassign
+              : action.kind === "sync"
+                ? confirmSync
+                : confirmRepair
           }
+          onCreateParticipant={createParticipantInAuth}
         />
       )}
     </section>
@@ -740,24 +551,16 @@ function EmployeePanel({
   busy,
   action,
   onCreateInAuth,
-  onFixCognito,
   onSyncAuth,
-  onReleaseDuplicate,
-  onClearWrong,
-  onFixPhone,
-  onReassignOwner,
+  onRepair,
 }: {
   emp: CorrectionEmployee;
   isProd: boolean;
   busy: boolean;
   action: ActionState | null;
   onCreateInAuth: () => void;
-  onFixCognito: () => void;
   onSyncAuth: () => void;
-  onReleaseDuplicate: () => void;
-  onClearWrong: () => void;
-  onFixPhone: () => void;
-  onReassignOwner: () => void;
+  onRepair: () => void;
 }) {
   const working = action?.phase === "previewing" || action?.phase === "running";
   return (
@@ -866,12 +669,8 @@ function EmployeePanel({
             "rounded-lg px-3 py-2 text-xs flex items-start gap-2",
             action.error ||
               (action.kind === "replay" && !action.replayResult?.ok) ||
-              (action.kind === "fix" && !action.fixResult?.ok) ||
               (action.kind === "sync" && !action.syncResult?.ok) ||
-              (action.kind === "release" && !action.releaseResult?.ok) ||
-              (action.kind === "clear" && !action.clearResult?.ok) ||
-              (action.kind === "phone" && !action.phoneResult?.ok) ||
-              (action.kind === "reassign" && !action.reassignResult?.ok)
+              (action.kind === "repair" && !action.repairResult?.ok)
               ? "border border-[hsl(var(--danger))]/40 bg-[hsl(var(--danger))]/10 text-[hsl(var(--danger))]"
               : "border border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400",
           )}
@@ -881,17 +680,9 @@ function EmployeePanel({
             {action.error ??
               (action.kind === "replay"
                 ? action.replayResult?.message
-                : action.kind === "fix"
-                  ? action.fixResult?.message
-                  : action.kind === "sync"
-                    ? action.syncResult?.message
-                    : action.kind === "release"
-                      ? action.releaseResult?.message
-                      : action.kind === "clear"
-                        ? action.clearResult?.message
-                        : action.kind === "phone"
-                          ? action.phoneResult?.message
-                          : action.reassignResult?.message)}
+                : action.kind === "sync"
+                  ? action.syncResult?.message
+                  : action.repairResult?.message)}
           </span>
         </div>
       )}
@@ -923,69 +714,17 @@ function EmployeePanel({
             Sync auth with corp
           </button>
         )}
-        {emp.actions.releaseDuplicateCognitoId && (
+        {emp.actions.repairCognito && (
           <button
             type="button"
             className={isProd ? "btn-danger" : "btn-primary"}
-            onClick={onReleaseDuplicate}
+            onClick={onRepair}
             disabled={busy}
           >
-            {working && action?.kind === "release" ? (
+            {working && action?.kind === "repair" ? (
               <Loader2 className="h-4 w-4 animate-spin" />
             ) : null}
-            Release duplicate cognito_id
-          </button>
-        )}
-        {emp.actions.clearWrongCognitoId && (
-          <button
-            type="button"
-            className={isProd ? "btn-danger" : "btn-primary"}
-            onClick={onClearWrong}
-            disabled={busy}
-          >
-            {working && action?.kind === "clear" ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : null}
-            Clear wrong cognito_id
-          </button>
-        )}
-        {emp.actions.fixCognitoPhone && (
-          <button
-            type="button"
-            className={isProd ? "btn-danger" : "btn-primary"}
-            onClick={onFixPhone}
-            disabled={busy}
-          >
-            {working && action?.kind === "phone" ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : null}
-            Update Cognito mobile from corp
-          </button>
-        )}
-        {emp.actions.reassignCognitoOwner && (
-          <button
-            type="button"
-            className={isProd ? "btn-danger" : "btn-primary"}
-            onClick={onReassignOwner}
-            disabled={busy}
-          >
-            {working && action?.kind === "reassign" ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : null}
-            Return account to its owner
-          </button>
-        )}
-        {emp.actions.fixCognitoId && (
-          <button
-            type="button"
-            className={isProd ? "btn-danger" : "btn-primary"}
-            onClick={onFixCognito}
-            disabled={busy}
-          >
-            {working && action?.kind === "fix" ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : null}
-            Fix cognito_id in corp + auth
+            Reassign / repair cognito_id
           </button>
         )}
         {emp.actions.syncAuthBlockedReason && (
@@ -993,19 +732,13 @@ function EmployeePanel({
             auth sync blocked: {emp.actions.syncAuthBlockedReason}
           </span>
         )}
-        {emp.actions.fixCognitoIdBlockedReason && (
-          <span className="text-xs text-[hsl(var(--muted-foreground))]">
-            cognito_id fix blocked: {emp.actions.fixCognitoIdBlockedReason}
-          </span>
-        )}
       </div>
 
       {emp.actions.cognitoAttributeDrift && (
         <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
           Note: the Cognito user&apos;s name/ucode differ from corp. The only
-          Cognito attribute this tool writes is the mobile number (via
-          &quot;Update Cognito mobile from corp&quot;) — fix name/ucode in
-          Cognito manually if needed.
+          Cognito attribute this tool ever writes is the mobile number — fix
+          name/ucode in Cognito manually if needed.
         </p>
       )}
     </div>
@@ -1142,29 +875,28 @@ function ConfirmModal({
   environment,
   onCancel,
   onConfirm,
+  onCreateParticipant,
 }: {
   action: ActionState;
   isProd: boolean;
   environment: Environment;
   onCancel: () => void;
   onConfirm: () => void;
+  onCreateParticipant: (empmasterId: string) => void;
 }) {
   const isReplay = action.kind === "replay";
   const isSync = action.kind === "sync";
-  const isRelease = action.kind === "release";
-  const isClear = action.kind === "clear";
-  const isPhone = action.kind === "phone";
-  const isReassign = action.kind === "reassign";
+  const isRepair = action.kind === "repair";
   const rp = action.replayPreview;
-  const fp = action.fixPreview;
   const sp = action.syncPreview;
-  const lp = action.releasePreview;
-  const cp = action.clearPreview;
-  const pp = action.phonePreview;
-  const ap = action.reassignPreview;
+  const xp = action.repairPreview;
+  const creating = action.creating;
+  const repairBlocked = isRepair && ((xp?.blockers.length ?? 0) > 0 || Boolean(creating));
+  const stepLabel = (source: "corp" | "auth") =>
+    source === "corp" ? "corp empmaster_hdr" : "auth Field_Force_Users";
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-      <div className="card w-full max-w-lg p-5 space-y-4 max-h-[85vh] overflow-y-auto">
+      <div className="card w-full max-w-2xl p-5 space-y-4 max-h-[85vh] overflow-y-auto">
         <div className="flex items-center gap-2">
           <AlertTriangle
             className={clsx(
@@ -1177,15 +909,7 @@ function ConfirmModal({
               ? `Replay events to auth — ${action.shortCode}`
               : isSync
                 ? `Sync auth with corp — ${action.shortCode}`
-                : isRelease
-                  ? `Release duplicate cognito_id — ${action.shortCode}`
-                  : isClear
-                    ? `Clear wrong cognito_id — ${action.shortCode}`
-                    : isPhone
-                      ? `Update Cognito mobile — ${action.shortCode}`
-                      : isReassign
-                        ? `Return account to its owner — ${action.shortCode}`
-                        : `Fix cognito_id — ${action.shortCode}`}
+                : `Reassign / repair cognito_id — ${action.shortCode}`}
           </h3>
           <span
             className={clsx(
@@ -1265,264 +989,68 @@ function ConfirmModal({
           </>
         )}
 
-        {isRelease && lp && (
+        {isRepair && xp && (
           <>
             <p className="text-xs text-[hsl(var(--muted-foreground))]">
-              The sub <code className="font-mono break-all">{lp.sub}</code>{" "}
-              belongs to <b>{action.shortCode}</b> (verified by corp mobile +
-              short code) but is also stored on the record
-              {lp.conflicts.length === 1 ? "" : "s"} below. Their{" "}
-              <code>cognito_id</code> will be set to <b>NULL</b> so the sub
-              identifies exactly one record. This employee&apos;s own rows are
-              not touched.
+              One run repairs every user whose details are intertwined with{" "}
+              <b>{action.shortCode}</b> — corp is the source of truth for who
+              owns which mobile and short code, Cognito for the cognito_id,
+              and the only Cognito write is the mobile number. {xp.message}
             </p>
+
             <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
               <table className="w-full text-xs">
                 <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
                   <tr>
-                    <th className="text-left font-medium px-3 py-1.5">Source</th>
-                    <th className="text-left font-medium px-3 py-1.5">Record</th>
+                    <th className="text-left font-medium px-3 py-1.5">User</th>
                     <th className="text-left font-medium px-3 py-1.5">Short code</th>
-                    <th className="text-left font-medium px-3 py-1.5">Company</th>
                     <th className="text-left font-medium px-3 py-1.5">Name</th>
+                    <th className="text-left font-medium px-3 py-1.5">Mobile</th>
+                    <th className="text-left font-medium px-3 py-1.5">Cognito account</th>
+                    <th className="text-left font-medium px-3 py-1.5">Auth</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {lp.conflicts.map((c) => (
-                    <tr
-                      key={`${c.source}-${c.id}`}
-                      className="border-t border-[hsl(var(--border))]"
-                    >
+                  {xp.participants.map((pt) => (
+                    <tr key={pt.empmasterId} className="border-t border-[hsl(var(--border))] align-top">
                       <td className="px-3 py-1.5 whitespace-nowrap">
-                        {c.source === "corp" ? "corp empmaster_hdr" : "auth Field_Force_Users"}
+                        {pt.role === "analyzed" ? "analyzed" : "intertwined"}
+                        <span className="block text-[10px] text-[hsl(var(--muted-foreground))]">
+                          empmaster {pt.empmasterId}
+                          {pt.companyCode ? ` · co ${pt.companyCode}` : ""}
+                        </span>
                       </td>
-                      <td className="px-3 py-1.5 font-mono">{c.id}</td>
-                      <td className="px-3 py-1.5 font-mono">{c.shortCode?.trim() || "—"}</td>
-                      <td className="px-3 py-1.5 font-mono">{c.companyCode?.trim() || "—"}</td>
-                      <td className="px-3 py-1.5">{c.name?.trim() || "—"}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
-              Note: the cleared record{lp.conflicts.length === 1 ? "" : "s"} will
-              be left without a cognito_id. If that user should have one, run a
-              correction for their mobile number afterwards.
-            </p>
-          </>
-        )}
-
-        {isClear && cp && (
-          <>
-            <p className="text-xs text-[hsl(var(--muted-foreground))]">
-              No Cognito user belongs to <b>{action.shortCode}</b>, and the
-              stored cognito_id is not this employee&apos;s. It will be set to{" "}
-              <b>NULL</b> on the record{cp.targets.length === 1 ? "" : "s"}{" "}
-              below:
-            </p>
-            <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
-              <table className="w-full text-xs">
-                <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
-                  <tr>
-                    <th className="text-left font-medium px-3 py-1.5">Source</th>
-                    <th className="text-left font-medium px-3 py-1.5">Record</th>
-                    <th className="text-left font-medium px-3 py-1.5">Stored cognito_id</th>
-                    <th className="text-left font-medium px-3 py-1.5">Why wrong</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {cp.targets.map((t) => (
-                    <tr
-                      key={`${t.source}-${t.id}`}
-                      className="border-t border-[hsl(var(--border))]"
-                    >
-                      <td className="px-3 py-1.5 whitespace-nowrap">
-                        {t.source === "corp" ? "corp empmaster_hdr" : "auth Field_Force_Users"}
-                      </td>
-                      <td className="px-3 py-1.5 font-mono">{t.id}</td>
-                      <td className="px-3 py-1.5 font-mono break-all">{t.sub}</td>
-                      <td className="px-3 py-1.5">{t.reason}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
-              If the sub belongs to another user, correct that user by analyzing
-              their mobile number afterwards. If this employee should have a
-              Cognito account, it must be created via signup separately.
-            </p>
-          </>
-        )}
-
-        {isPhone && pp && (
-          <>
-            <p className="text-xs text-[hsl(var(--muted-foreground))]">
-              The Cognito user of <b>{action.shortCode}</b> (matched by the
-              stored cognito_id + short code) holds the wrong mobile. Its{" "}
-              <code>phone_number</code> will be set to the corp mobile and
-              marked verified — this is a <b>write to Cognito</b> and changes
-              the number the user logs in with.
-            </p>
-            <div className="rounded-lg border border-[hsl(var(--border))] text-xs divide-y divide-[hsl(var(--border))]">
-              <div className="px-3 py-2 flex items-baseline gap-2">
-                <span className="w-28 shrink-0 text-[hsl(var(--muted-foreground))]">
-                  Cognito sub
-                </span>
-                <span className="font-mono break-all">{pp.sub}</span>
-              </div>
-              <div className="px-3 py-2 flex items-baseline gap-2">
-                <span className="w-28 shrink-0 text-[hsl(var(--muted-foreground))]">
-                  Mobile (before)
-                </span>
-                <span className="font-mono">{pp.oldMobile ?? "—"}</span>
-              </div>
-              <div className="px-3 py-2 flex items-baseline gap-2">
-                <span className="w-28 shrink-0 text-[hsl(var(--muted-foreground))]">
-                  Mobile (after)
-                </span>
-                <span className="font-mono text-emerald-700 dark:text-emerald-400">
-                  {pp.newMobile}
-                </span>
-                <span className="text-[hsl(var(--muted-foreground))]">
-                  (corp — source of truth)
-                </span>
-              </div>
-            </div>
-            {pp.oldMobileHolders.length > 0 ? (
-              <>
-                <p className="text-xs text-amber-700 dark:text-amber-400">
-                  The old Cognito mobile <b>{pp.oldMobile}</b> belongs to the
-                  following corp/auth record
-                  {pp.oldMobileHolders.length === 1 ? "" : "s"} — after this
-                  update frees the number in Cognito, analyze{" "}
-                  <b>{pp.oldMobile}</b> to bring that user in sync:
-                </p>
-                <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
-                  <table className="w-full text-xs">
-                    <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
-                      <tr>
-                        <th className="text-left font-medium px-3 py-1.5">Source</th>
-                        <th className="text-left font-medium px-3 py-1.5">Record</th>
-                        <th className="text-left font-medium px-3 py-1.5">Short code</th>
-                        <th className="text-left font-medium px-3 py-1.5">Company</th>
-                        <th className="text-left font-medium px-3 py-1.5">Name</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {pp.oldMobileHolders.map((h) => (
-                        <tr
-                          key={`${h.source}-${h.id}`}
-                          className="border-t border-[hsl(var(--border))]"
-                        >
-                          <td className="px-3 py-1.5 whitespace-nowrap">
-                            {h.source === "corp" ? "corp empmaster_hdr" : "auth Field_Force_Users"}
-                          </td>
-                          <td className="px-3 py-1.5 font-mono">{h.id}</td>
-                          <td className="px-3 py-1.5 font-mono">{h.shortCode?.trim() || "—"}</td>
-                          <td className="px-3 py-1.5 font-mono">{h.companyCode?.trim() || "—"}</td>
-                          <td className="px-3 py-1.5">{h.name?.trim() || "—"}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </>
-            ) : (
-              <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
-                No corp/auth employee holds the old mobile {pp.oldMobile ?? "—"} —
-                nothing else to correct afterwards.
-              </p>
-            )}
-          </>
-        )}
-
-        {isReassign && ap && ap.owner && (
-          <>
-            <p className="text-xs text-[hsl(var(--muted-foreground))]">
-              This Cognito account holds <b>{action.shortCode}</b>&apos;s corp
-              mobile, but its short code says it belongs to{" "}
-              <b>{ap.owner.shortCode}</b> ({ap.owner.corpName?.trim() || "—"}).
-              The short code is the identity anchor — Cognito attributes are
-              never rewritten. This run returns the account to its owner:
-            </p>
-            <div className="rounded-lg border border-[hsl(var(--border))] text-xs divide-y divide-[hsl(var(--border))]">
-              <div className="px-3 py-2 flex items-baseline gap-2">
-                <span className="w-28 shrink-0 text-[hsl(var(--muted-foreground))]">
-                  Cognito sub
-                </span>
-                <span className="font-mono break-all">{ap.sub}</span>
-              </div>
-              <div className="px-3 py-2 flex items-baseline gap-2">
-                <span className="w-28 shrink-0 text-[hsl(var(--muted-foreground))]">
-                  Owner (corp)
-                </span>
-                <span className="break-all">
-                  <span className="font-mono">{ap.owner.shortCode}</span>
-                  {" · "}
-                  {ap.owner.corpName?.trim() || "—"} {" · empmaster "}
-                  <span className="font-mono">{ap.owner.corpId}</span>
-                  {" · company "}
-                  <span className="font-mono">{ap.owner.companyCode?.trim() || "—"}</span>
-                </span>
-              </div>
-              <div className="px-3 py-2 flex items-baseline gap-2">
-                <span className="w-28 shrink-0 text-[hsl(var(--muted-foreground))]">
-                  Cognito mobile
-                </span>
-                {ap.phoneChange ? (
-                  <span className="font-mono">
-                    {ap.phoneChange.before ?? "—"}{" "}
-                    <span className="text-[hsl(var(--muted-foreground))]">→</span>{" "}
-                    <span className="text-emerald-700 dark:text-emerald-400">
-                      {ap.phoneChange.after}
-                    </span>{" "}
-                    <span className="text-[hsl(var(--muted-foreground))]">
-                      (owner&apos;s corp mobile — the only Cognito write)
-                    </span>
-                  </span>
-                ) : (
-                  <span className="font-mono">
-                    {ap.owner.corpMobile}{" "}
-                    <span className="pill bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
-                      already correct
-                    </span>
-                  </span>
-                )}
-              </div>
-            </div>
-            <p className="text-xs text-[hsl(var(--muted-foreground))]">
-              Based on the short code in Cognito, the cognito_id is then
-              written to the owner&apos;s records:
-            </p>
-            <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
-              <table className="w-full text-xs">
-                <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
-                  <tr>
-                    <th className="text-left font-medium px-3 py-1.5">Owner record</th>
-                    <th className="text-left font-medium px-3 py-1.5">ID</th>
-                    <th className="text-left font-medium px-3 py-1.5">cognito_id before</th>
-                    <th className="text-left font-medium px-3 py-1.5">After</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {ap.writes.map((w) => (
-                    <tr key={`${w.source}-${w.id}`} className="border-t border-[hsl(var(--border))]">
-                      <td className="px-3 py-1.5 whitespace-nowrap">
-                        {w.source === "corp" ? "corp empmaster_hdr" : "auth Field_Force_Users"}
-                      </td>
-                      <td className="px-3 py-1.5 font-mono">{w.id}</td>
-                      <td className="px-3 py-1.5 font-mono break-all">{w.before?.trim() || "—"}</td>
+                      <td className="px-3 py-1.5 font-mono">{pt.shortCode || "—"}</td>
+                      <td className="px-3 py-1.5">{pt.name?.trim() || "—"}</td>
+                      <td className="px-3 py-1.5 font-mono">{pt.mobile10 || "—"}</td>
                       <td className="px-3 py-1.5">
-                        {w.needsUpdate ? (
-                          <span className="font-mono break-all text-emerald-700 dark:text-emerald-400">
-                            {ap.sub}
-                          </span>
+                        {pt.accountSub ? (
+                          <>
+                            <span className="font-mono break-all">{pt.accountSub}</span>
+                            <span className="block text-[10px] text-[hsl(var(--muted-foreground))]">
+                              {pt.accountVia === "mobile"
+                                ? "matched by corp mobile + short code"
+                                : "matched by short code — mobile gets corrected"}
+                            </span>
+                          </>
                         ) : (
-                          <span className="pill bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">
-                            already correct
+                          <span className="italic text-[hsl(var(--muted-foreground))]">none resolves</span>
+                        )}
+                        {pt.notes.map((n, i) => (
+                          <span key={i} className="block text-[10px] text-amber-700 dark:text-amber-400">
+                            {n}
                           </span>
+                        ))}
+                      </td>
+                      <td className="px-3 py-1.5">
+                        {pt.missingInAuth ? (
+                          <span className="pill bg-red-500/15 text-red-600 dark:text-red-400">
+                            missing
+                          </span>
+                        ) : pt.authId ? (
+                          <span className="font-mono">{pt.authId}</span>
+                        ) : (
+                          <span className="text-[hsl(var(--muted-foreground))]">—</span>
                         )}
                       </td>
                     </tr>
@@ -1530,44 +1058,121 @@ function ConfirmModal({
                 </tbody>
               </table>
             </div>
-            {ap.owner.authId === null && (
-              <p className="text-[11px] text-amber-700 dark:text-amber-400">
-                The owner has no auth record — only the corp side receives the
-                cognito_id; create them in auth via their own analysis if
-                needed.
-              </p>
+
+            {xp.blockers.length > 0 && (
+              <div className="rounded-lg border border-red-500/40 bg-red-500/5 px-3 py-2 space-y-2 text-xs text-red-600 dark:text-red-400">
+                {xp.blockers.map((b, i) => (
+                  <p key={i}>{b}</p>
+                ))}
+                {xp.participants
+                  .filter((pt) => pt.missingInAuth && pt.replayEvents > 0)
+                  .map((pt) => (
+                    <button
+                      key={pt.empmasterId}
+                      type="button"
+                      className={isProd ? "btn-danger" : "btn-primary"}
+                      onClick={() => onCreateParticipant(pt.empmasterId)}
+                      disabled={Boolean(creating)}
+                    >
+                      {creating === pt.empmasterId ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : null}
+                      Create {pt.shortCode || pt.empmasterId} in auth (replay{" "}
+                      {pt.replayEvents} event{pt.replayEvents === 1 ? "" : "s"})
+                    </button>
+                  ))}
+                {creating && (
+                  <p className="text-[11px]">
+                    Waiting for the auth consumer to create the record — the
+                    plan refreshes automatically…
+                  </p>
+                )}
+              </div>
             )}
-            {ap.clearedFrom.length > 0 && (
+
+            {action.error && (
+              <p className="text-xs text-red-600 dark:text-red-400">{action.error}</p>
+            )}
+
+            {xp.steps.length > 0 && (
               <>
-                <p className="text-xs text-red-600 dark:text-red-400">
-                  The stale link on <b>{action.shortCode}</b>&apos;s record
-                  {ap.clearedFrom.length === 1 ? "" : "s"} below is set to{" "}
-                  <b>NULL</b> in the same run:
+                <p className="text-xs text-[hsl(var(--muted-foreground))]">
+                  Steps, in apply order (Cognito mobile → cognito_id writes →
+                  stale-link clears; DB steps only apply if the row is
+                  unchanged since this preview):
                 </p>
                 <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
                   <table className="w-full text-xs">
                     <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
                       <tr>
-                        <th className="text-left font-medium px-3 py-1.5">Record</th>
-                        <th className="text-left font-medium px-3 py-1.5">ID</th>
-                        <th className="text-left font-medium px-3 py-1.5">Short code</th>
-                        <th className="text-left font-medium px-3 py-1.5">Company</th>
-                        <th className="text-left font-medium px-3 py-1.5">Name</th>
+                        <th className="text-left font-medium px-3 py-1.5">#</th>
+                        <th className="text-left font-medium px-3 py-1.5">Step</th>
+                        <th className="text-left font-medium px-3 py-1.5">Target</th>
+                        <th className="text-left font-medium px-3 py-1.5">Before</th>
+                        <th className="text-left font-medium px-3 py-1.5">After</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {ap.clearedFrom.map((c) => (
-                        <tr
-                          key={`${c.source}-${c.id}`}
-                          className="border-t border-[hsl(var(--border))]"
-                        >
-                          <td className="px-3 py-1.5 whitespace-nowrap">
-                            {c.source === "corp" ? "corp empmaster_hdr" : "auth Field_Force_Users"}
-                          </td>
-                          <td className="px-3 py-1.5 font-mono">{c.id}</td>
-                          <td className="px-3 py-1.5 font-mono">{c.shortCode?.trim() || "—"}</td>
-                          <td className="px-3 py-1.5 font-mono">{c.companyCode?.trim() || "—"}</td>
-                          <td className="px-3 py-1.5">{c.name?.trim() || "—"}</td>
+                      {xp.steps.map((st, i) => (
+                        <tr key={i} className="border-t border-[hsl(var(--border))] align-top">
+                          <td className="px-3 py-1.5">{i + 1}</td>
+                          {st.kind === "cognitoPhone" ? (
+                            <>
+                              <td className="px-3 py-1.5 whitespace-nowrap">
+                                Cognito mobile update
+                              </td>
+                              <td className="px-3 py-1.5">
+                                account of <span className="font-mono">{st.shortCode}</span>
+                                <span className="block text-[10px] font-mono text-[hsl(var(--muted-foreground))] break-all">
+                                  {st.sub}
+                                </span>
+                              </td>
+                              <td className="px-3 py-1.5 font-mono">{st.before ?? "—"}</td>
+                              <td className="px-3 py-1.5 font-mono text-emerald-700 dark:text-emerald-400">
+                                {st.after}
+                              </td>
+                            </>
+                          ) : st.kind === "dbWrite" ? (
+                            <>
+                              <td className="px-3 py-1.5 whitespace-nowrap">
+                                cognito_id write
+                              </td>
+                              <td className="px-3 py-1.5">
+                                {stepLabel(st.source)}{" "}
+                                <span className="font-mono">{st.id}</span>
+                                {st.shortCode ? (
+                                  <span className="block text-[10px] text-[hsl(var(--muted-foreground))]">
+                                    {st.shortCode}
+                                  </span>
+                                ) : null}
+                              </td>
+                              <td className="px-3 py-1.5 font-mono break-all">
+                                {st.before ?? "—"}
+                              </td>
+                              <td className="px-3 py-1.5 font-mono break-all text-emerald-700 dark:text-emerald-400">
+                                {st.after}
+                              </td>
+                            </>
+                          ) : (
+                            <>
+                              <td className="px-3 py-1.5 whitespace-nowrap">
+                                clear stale link
+                              </td>
+                              <td className="px-3 py-1.5">
+                                {stepLabel(st.source)}{" "}
+                                <span className="font-mono">{st.id}</span>
+                                {st.shortCode ? (
+                                  <span className="block text-[10px] text-[hsl(var(--muted-foreground))]">
+                                    {st.shortCode}
+                                  </span>
+                                ) : null}
+                              </td>
+                              <td className="px-3 py-1.5 font-mono break-all">{st.before}</td>
+                              <td className="px-3 py-1.5 font-mono text-red-600 dark:text-red-400">
+                                NULL
+                              </td>
+                            </>
+                          )}
                         </tr>
                       ))}
                     </tbody>
@@ -1575,52 +1180,19 @@ function ConfirmModal({
                 </div>
               </>
             )}
-            <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
-              After the run, re-check this employee and analyze{" "}
-              {ap.owner.corpMobile} to verify the owner.
-            </p>
-          </>
-        )}
 
-        {action.kind === "fix" && fp && (
-          <>
-            <p className="text-xs text-[hsl(var(--muted-foreground))]">
-              {fp.message}
+            {xp.warnings.length > 0 && (
+              <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 space-y-1 text-[11px] text-amber-700 dark:text-amber-400">
+                {xp.warnings.map((w, i) => (
+                  <p key={i}>{w}</p>
+                ))}
+              </div>
+            )}
+
+            <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
+              After the run, re-check this employee and analyze the other
+              user&apos;s mobile to verify both ended up consistent.
             </p>
-            <div className="rounded-lg border border-[hsl(var(--border))] text-xs divide-y divide-[hsl(var(--border))]">
-              <div className="px-3 py-2 flex items-baseline gap-2">
-                <span className="w-24 shrink-0 text-[hsl(var(--muted-foreground))]">
-                  Live sub
-                </span>
-                <span className="font-mono break-all">{fp.sub}</span>
-              </div>
-              <div className="px-3 py-2 flex items-baseline gap-2">
-                <span className="w-24 shrink-0 text-[hsl(var(--muted-foreground))]">
-                  corp before
-                </span>
-                <span className="font-mono break-all">
-                  {fp.corp.before?.trim() || "—"}
-                </span>
-                {!fp.corp.needsUpdate && (
-                  <span className="pill bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 ml-auto">
-                    already correct
-                  </span>
-                )}
-              </div>
-              <div className="px-3 py-2 flex items-baseline gap-2">
-                <span className="w-24 shrink-0 text-[hsl(var(--muted-foreground))]">
-                  auth before
-                </span>
-                <span className="font-mono break-all">
-                  {fp.auth.before?.trim() || "—"}
-                </span>
-                {!fp.auth.needsUpdate && (
-                  <span className="pill bg-emerald-500/15 text-emerald-600 dark:text-emerald-400 ml-auto">
-                    already correct
-                  </span>
-                )}
-              </div>
-            </div>
           </>
         )}
 
@@ -1632,20 +1204,18 @@ function ConfirmModal({
             type="button"
             className={isProd ? "btn-danger" : "btn-primary"}
             onClick={onConfirm}
+            disabled={repairBlocked}
+            title={
+              repairBlocked
+                ? "Create the missing auth record(s) first — the confirm unlocks once they exist"
+                : undefined
+            }
           >
             {isReplay
               ? "Confirm replay"
               : isSync
                 ? "Confirm sync"
-                : isRelease
-                  ? "Confirm release"
-                  : isClear
-                    ? "Confirm clear"
-                    : isPhone
-                      ? "Confirm Cognito update"
-                      : isReassign
-                        ? "Confirm reassign"
-                        : "Confirm update"}
+                : "Confirm repair"}
           </button>
         </div>
       </div>

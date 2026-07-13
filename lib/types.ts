@@ -429,30 +429,16 @@ export type CorrectionEmployee = {
   actions: {
     /** Missing in auth → offer the event replay. */
     createInAuth: boolean;
-    /** A resolved Cognito sub differs from corp/auth cognito_id → offer fix. */
-    fixCognitoId: boolean;
-    /** Why the cognito_id fix is currently blocked (when it IS needed). */
-    fixCognitoIdBlockedReason?: string;
     /** Auth exists but name / mobile / ucode drifted from corp → offer sync. */
     syncAuthFromCorp: boolean;
     /** Why the auth sync is currently blocked (when drift exists). */
     syncAuthBlockedReason?: string;
     /** Cognito name/ucode drift exists — not auto-corrected by this tool. */
     cognitoAttributeDrift: boolean;
-    /** The live sub is also stored on other records → offer to NULL it there. */
-    releaseDuplicateCognitoId: boolean;
-    /** No rightful Cognito user + the stored cognito_id is stale or belongs
-     * to a different user → offer to NULL it on this employee's records. */
-    clearWrongCognitoId: boolean;
-    /** The stored sub's Cognito owner matches the corp short code but holds a
-     * different mobile → offer to push the corp mobile to Cognito. */
-    fixCognitoPhone: boolean;
-    /** The stored sub's Cognito owner holds THIS employee's corp mobile but
-     * its short code identifies a different employee → offer to return the
-     * account to its short-code owner (fix its Cognito mobile from the
-     * owner's corp record, write its sub to the owner's corp/auth, clear the
-     * stale link here). Cognito identity attributes are never rewritten. */
-    reassignCognitoOwner: boolean;
+    /** ANY cognito_id entanglement detected — mismatched / duplicated /
+     * stale / criss-crossed with another user — offer the single unified
+     * repair (preview shows every step across both intertwined users). */
+    repairCognito: boolean;
   };
   /** Conditions that prevent automatic correction (need manual attention). */
   blockers: string[];
@@ -489,16 +475,6 @@ export type CorrectionReplayResult = {
   preview: boolean;
 };
 
-export type CorrectionFixResult = {
-  ok: boolean;
-  message: string;
-  /** The live Cognito sub being written. */
-  sub: string;
-  corp: { empmasterId: string; before: string | null; needsUpdate: boolean; updated: boolean };
-  auth: { id: string; before: string | null; needsUpdate: boolean; updated: boolean };
-  preview: boolean;
-};
-
 /** The Cognito owner (or absence) of a cognito_id stored on this employee. */
 export type CorrectionStoredSubOwner = {
   sub: string;
@@ -516,91 +492,6 @@ export type CorrectionStoredSubOwner = {
   error?: string;
 };
 
-export type CorrectionClearResult = {
-  ok: boolean;
-  message: string;
-  /** The sides that would be / were cleared, with the stored sub and reason. */
-  targets: { source: "corp" | "auth"; id: string; sub: string; reason: string }[];
-  /** Rows actually cleared (0 in preview). */
-  cleared: number;
-  preview: boolean;
-};
-
-/** A corp/auth employee currently holding the OLD (wrong) Cognito mobile. */
-export type CorrectionOldMobileHolder = {
-  source: "corp" | "auth";
-  id: string;
-  shortCode: string | null;
-  companyCode: string | null;
-  name: string | null;
-};
-
-export type CorrectionPhoneFixResult = {
-  ok: boolean;
-  message: string;
-  /** The Cognito user being updated. */
-  sub: string;
-  username: string;
-  /** Current (wrong) Cognito mobile, 10-digit display form. */
-  oldMobile: string | null;
-  /** Corp mobile that will be written, 10-digit display form. */
-  newMobile: string;
-  /** Corp/auth employees currently holding the OLD Cognito mobile — surfaced
-   * so the operator can analyze that number and correct them too. */
-  oldMobileHolders: CorrectionOldMobileHolder[];
-  updated: boolean;
-  preview: boolean;
-};
-
-/** One cognito_id write the reassign performs on the OWNER's records. */
-export type CorrectionReassignWrite = {
-  source: "corp" | "auth";
-  /** empmaster_id (corp) or Field_Force_Users.id (auth). */
-  id: string;
-  before: string | null;
-  /** false when the record already stores the sub. */
-  needsUpdate: boolean;
-};
-
-/**
- * "Return account to its short-code owner": the Cognito account linked from
- * THIS employee's records is labeled with a different short code — per that
- * short code (the identity anchor; never rewritten) it belongs to another
- * corp employee. One run repairs both users: the account's Cognito mobile is
- * set to the OWNER's corp mobile (the only Cognito write), its sub is written
- * to the owner's corp/auth records, and the stale link on THIS employee is
- * NULLed.
- */
-export type CorrectionReassignResult = {
-  ok: boolean;
-  message: string;
-  /** The Cognito account being returned to its owner. */
-  sub: string;
-  username: string;
-  /** The owner per the account's custom:emp_short_code. */
-  owner: {
-    shortCode: string;
-    /** Name on the Cognito account (display only — never written). */
-    cognitoName: string | null;
-    corpId: string;
-    companyCode: string | null;
-    corpName: string | null;
-    /** Owner's corp mobile, 10-digit — the value pushed to Cognito. */
-    corpMobile: string;
-    authId: string | null;
-  } | null;
-  /** Cognito phone change (null when already equal to the owner's corp mobile). */
-  phoneChange: { before: string | null; after: string } | null;
-  /** cognito_id writes on the owner's corp/auth records. */
-  writes: CorrectionReassignWrite[];
-  /** THIS employee's records whose stale link to the sub is NULLed. */
-  clearedFrom: CorrectionConflict[];
-  /** Rows actually NULLed (0 in preview). */
-  cleared: number;
-  updated: boolean;
-  preview: boolean;
-};
-
 /** Another corp/auth record holding a cognito_id that belongs to this employee. */
 export type CorrectionConflict = {
   source: "corp" | "auth";
@@ -611,15 +502,76 @@ export type CorrectionConflict = {
   name: string | null;
 };
 
-export type CorrectionReleaseResult = {
+/**
+ * One user involved in a cognito_id criss-cross repair. `analyzed` is the
+ * employee the operator looked up; `other` users are discovered from the
+ * entanglement (a sub stored on their records, or their account holding the
+ * analyzed employee's mobile / stored sub).
+ */
+export type CorrectionRepairParticipant = {
+  role: "analyzed" | "other";
+  empmasterId: string;
+  shortCode: string;
+  companyCode: string | null;
+  name: string | null;
+  /** Corp mobile, 10-digit. */
+  mobile10: string | null;
+  /** Auth Field_Force_Users.id (null when missing in auth). */
+  authId: string | null;
+  missingInAuth: boolean;
+  /** Corp events on their `employee_<id>` stream — >0 means the missing auth
+   * record can be re-created by replay (button in the repair modal). */
+  replayEvents: number;
+  /** Rightful Cognito account resolved for this user (sub), if any. */
+  accountSub: string | null;
+  /** How the account was resolved: corp mobile + short code match, or the
+   * short code on an already-linked account (phone gets corrected). */
+  accountVia: "mobile" | "shortCode" | null;
+  notes: string[];
+};
+
+/** One write the unified repair performs, in apply order. */
+export type CorrectionRepairStep =
+  | {
+      kind: "cognitoPhone";
+      /** Account being updated (identified by sub; username used for the call). */
+      sub: string;
+      username: string;
+      /** Whose corp record supplies the new mobile. */
+      shortCode: string;
+      before: string | null;
+      after: string;
+    }
+  | {
+      kind: "dbWrite";
+      source: "corp" | "auth";
+      id: string;
+      /** Whose record this is. */
+      shortCode: string | null;
+      before: string | null;
+      after: string;
+    }
+  | {
+      kind: "dbClear";
+      source: "corp" | "auth";
+      id: string;
+      shortCode: string | null;
+      before: string;
+    };
+
+export type CorrectionRepairResult = {
   ok: boolean;
   message: string;
-  /** The live sub whose duplicates are being released. */
-  sub: string;
-  /** The records whose cognito_id would be / was set to NULL. */
-  conflicts: CorrectionConflict[];
-  /** Rows actually cleared (0 in preview). */
-  cleared: number;
+  participants: CorrectionRepairParticipant[];
+  steps: CorrectionRepairStep[];
+  /** Confirm is refused while any blocker exists (e.g. a participant missing
+   * in auth who can be created — the modal offers the create button). */
+  blockers: string[];
+  /** Non-blocking cautions (sides skipped, manual follow-ups). */
+  warnings: string[];
+  /** Steps actually applied (0 in preview). */
+  applied: number;
+  updated: boolean;
   preview: boolean;
 };
 

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { fixCognitoPhone } from "@/lib/correction";
+import { repairCognitoLinks } from "@/lib/correction";
 import type { Environment } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -10,7 +10,7 @@ const ALLOWED_ENVS: Environment[] = ["prod", "stage"];
 type Body = {
   environment?: Environment;
   empmasterId?: string;
-  /** true → report the old/new mobile + old-mobile holders without writing. */
+  /** true → return the repair plan (participants + steps) without writing. */
   preview?: boolean;
 };
 
@@ -34,11 +34,11 @@ export async function POST(req: Request) {
   }
 
   try {
-    const result = await fixCognitoPhone(environment, empmasterId, preview);
+    const result = await repairCognitoLinks(environment, empmasterId, preview);
     return NextResponse.json(result);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    console.error(`[correction/fix-cognito-phone ${environment} ${empmasterId}]`, msg);
+    console.error(`[correction/repair ${environment} ${empmasterId}]`, msg);
     return NextResponse.json({ error: msg }, { status: 500 });
   }
 }
