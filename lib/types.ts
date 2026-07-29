@@ -115,13 +115,22 @@ export type BatchStatusRow = {
 
 export type CounterView = "division" | "products" | "stockist";
 
-/** A column in a counter results table — drives both the SQL alias and the UI header. */
+/**
+ * A column in a column-driven results table — drives both the SQL alias and the
+ * UI header. Used by the Counter Events views AND the Raw Event Payloads card
+ * (both render through `CounterTable` and export through `rowsToCsv`).
+ */
 export type CounterColumn = {
   /** Matches the SELECT alias / row key. */
   key: string;
   label: string;
   /** Render as a localized date/time. */
   isDate?: boolean;
+  /**
+   * Render as a JSON blob — the cell value (a JSON string) is pretty-printed
+   * inside a scrollable `<pre>`. CSV export keeps the compact single-line form.
+   */
+  json?: boolean;
 };
 
 /** Filters for a counter-events query. `streamIds` is mandatory; the rest are optional. */

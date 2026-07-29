@@ -42,8 +42,19 @@ export function CounterTable({
               className="border-t border-[hsl(var(--border))] hover:bg-[hsl(var(--muted))]/40"
             >
               {columns.map((c) => (
-                <td key={c.key} className="px-3 py-2 align-middle font-mono">
-                  {formatCell(row[c.key], c.isDate)}
+                <td
+                  key={c.key}
+                  className={
+                    c.json
+                      ? "px-3 py-2 align-top font-mono"
+                      : "px-3 py-2 align-middle font-mono"
+                  }
+                >
+                  {c.json ? (
+                    <JsonCell value={row[c.key]} />
+                  ) : (
+                    formatCell(row[c.key], c.isDate)
+                  )}
                 </td>
               ))}
             </tr>
@@ -61,4 +72,28 @@ function formatCell(value: unknown, isDate?: boolean): string {
     return Number.isNaN(d.getTime()) ? String(value) : d.toLocaleString();
   }
   return String(value);
+}
+
+/**
+ * Renders a JSON payload cell. The value arrives as a JSON string (from
+ * `jsonb::text`); we pretty-print it for readability and keep it inside a
+ * bounded, scrollable box so a large payload never blows out the table layout.
+ * Falls back to the raw string if it isn't valid JSON.
+ */
+function JsonCell({ value }: { value: unknown }) {
+  if (value === null || value === undefined || value === "") {
+    return <span>—</span>;
+  }
+  const raw = String(value);
+  let text = raw;
+  try {
+    text = JSON.stringify(JSON.parse(raw), null, 2);
+  } catch {
+    // Not JSON — show the raw string as-is.
+  }
+  return (
+    <pre className="max-w-[520px] max-h-56 overflow-auto whitespace-pre-wrap break-words text-[11px] leading-snug">
+      {text}
+    </pre>
+  );
 }
