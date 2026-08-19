@@ -5,7 +5,21 @@ import {
   lookupBySub,
   updateUserPhone,
 } from "./cognito";
+import { CognitoIdentityProviderServiceException } from "@aws-sdk/client-cognito-identity-provider";
 import { norm, normalizeMobile, pairKey } from "./auth-comparison";
+import {
+  CANON,
+  describeHolder,
+  findCognitoHolders,
+  findMobileHolders,
+  findShortCodePairHolders,
+  findUcodeHolders,
+  holderKey,
+  rowKey,
+  validateNetUniqueness,
+  type Assignment,
+  type Holder,
+} from "./integrity";
 import { displayMobile10, normalizeName } from "./format";
 import { sendAuthQueueMessage } from "./sqs";
 import type {
@@ -744,6 +758,13 @@ async function resolveCognitoByMobileOnce(
  * SDK's SNS publishing. Preview returns the event list without sending.
  * A run is refused while the employee already exists in auth — the replay
  * is strictly the "missing in auth" recovery path.
+ *
+ * The replayed EMPLOYEE_ADD is subject to auth's own uniqueness guards
+ * (cross-table mobile, (short code, company), cross-table ucode). Those are
+ * pre-flighted here against the CURRENT corp values — the state the whole
+ * replay converges to, even when the stream carries later EMPLOYEE_EDITs — so
+ * a duplicate is reported in the preview instead of surfacing later as a row
+ * in the auth-backend's Event_Failures table.
  */
 export async function replayEmployeeStream(
   environment: Environment,
@@ -760,6 +781,8 @@ export async function replayEmployeeStream(
       events: [],
       sent: 0,
       errors: [],
+      blockers: [],
+      warnings: [],
       preview,
     };
   }
@@ -788,43 +811,46 @@ export async function replayEmployeeStream(
       events: [],
       sent: 0,
       errors: [],
+      blockers: [],
+      warnings: [],
       preview,
     };
   }
 
+  // Pre-flight auth's own EMPLOYEE_ADD uniqueness guards (this also covers the
+  // "already exists in auth" refusal — the (short code, company) pair is one of
+  // the three checks).
+  const { blockers, warnings } = await checkReplayIntegrity(environment, corp);
+
   if (preview) {
     return {
       ok: true,
-      message: `${rows.length} event${rows.length === 1 ? "" : "s"} on stream ${streamId} would be replayed to the auth queue (in timestamp order).`,
+      message:
+        blockers.length > 0
+          ? `Replay blocked — ${blockers.length} value${blockers.length === 1 ? "" : "s"} the auth consumer requires to be unique ${blockers.length === 1 ? "is" : "are"} already taken; resolve ${blockers.length === 1 ? "it" : "them"} before replaying ${rows.length} event${rows.length === 1 ? "" : "s"}.`
+          : `${rows.length} event${rows.length === 1 ? "" : "s"} on stream ${streamId} would be replayed to the auth queue (in timestamp order).`,
       streamId,
       totalEvents: rows.length,
       events: summaries,
       sent: 0,
       errors: [],
+      blockers,
+      warnings,
       preview: true,
     };
   }
 
-  // Refuse a live run when the employee already exists in auth — replaying
-  // EMPLOYEE_ADD onto an existing user risks duplicates in auth.
-  const existing = await fetchAuthByShortCodes(
-    environment,
-    [norm(corp.emp_shortcode)].filter(Boolean),
-  );
-  const alreadyPresent = existing.some(
-    (a) =>
-      pairKey(a.short_code, a.company_code) ===
-      pairKey(corp.emp_shortcode, corp.company_code),
-  );
-  if (alreadyPresent) {
+  if (blockers.length > 0) {
     return {
       ok: false,
-      message: `Employee ${norm(corp.emp_shortcode)} already exists in auth — replay is only for employees missing in auth.`,
+      message: `Replay blocked: ${blockers.join(" ")}`,
       streamId,
       totalEvents: rows.length,
       events: summaries,
       sent: 0,
       errors: [],
+      blockers,
+      warnings,
       preview: false,
     };
   }
@@ -856,8 +882,97 @@ export async function replayEmployeeStream(
     events: summaries,
     sent,
     errors,
+    blockers: [],
+    warnings,
     preview: false,
   };
+}
+
+/**
+ * The three uniqueness guards auth-backend's EMPLOYEE_ADD applies, run against
+ * the corp record BEFORE any event is queued:
+ *
+ *   - `mobile_no` free across `Admin_Users`, `Field_Force_Users`,
+ *     `Counter_Company_Lnk`, `Delegate_Users`, `Stockists` (`getUserData`);
+ *   - `(short_code, company_code)` free in `Field_Force_Users` (`getOneUser`) —
+ *     this is also the "already exists in auth" case, so the replay's original
+ *     refusal is now surfaced at preview time instead of only on the live run;
+ *   - `ucode` free across `Admin_Users`, `Field_Force_Users`, `Counters`,
+ *     `Delegate_Users`, `Stockists` (`getUserDataWithEmail`).
+ *
+ * The employee is absent from auth, so there is no own row to exclude: any
+ * holder at all is a collision. A blank corp value is skipped — auth only
+ * checks a mobile when `message.data.mobile_no` is truthy.
+ */
+async function checkReplayIntegrity(
+  environment: Environment,
+  corp: CorpRow,
+): Promise<{ blockers: string[]; warnings: string[] }> {
+  const blockers: string[] = [];
+  const warnings: string[] = [];
+
+  const shortCode = norm(corp.emp_shortcode);
+  const label = `${shortCode || "this employee"} (corp empmaster ${corp.empmaster_id})`;
+
+  const mobile10 = normalizeMobile(corp.mobile_no);
+  const [mobileHolders, pairHolders, ucodeHolders] = await Promise.all([
+    mobile10 ? findMobileHolders(environment, [mobile10, norm(corp.mobile_no)]) : [],
+    shortCode ? findShortCodePairHolders(environment, shortCode, corp.company_code) : [],
+    norm(corp.ucode) ? findUcodeHolders(environment, [norm(corp.ucode)]) : [],
+  ]);
+
+  if (mobile10) {
+    for (const h of mobileHolders) {
+      blockers.push(
+        `Mobile ${mobile10} is already held by ${describeHolder(h)} — the replayed EMPLOYEE_ADD would be rejected by auth's cross-table mobile check.${await freeItFirstHint(environment, h, "mobile_no")}`,
+      );
+    }
+  } else {
+    warnings.push(
+      "Corp has no mobile number for this employee — auth skips its mobile uniqueness check, but the user will land without a mobile.",
+    );
+  }
+
+  for (const h of pairHolders) {
+    blockers.push(
+      `Short code ${shortCode} is already used in company ${norm(corp.company_code) || "—"} by ${describeHolder(h)} — replay is only for employees missing in auth.`,
+    );
+  }
+
+  if (norm(corp.ucode)) {
+    for (const h of ucodeHolders) {
+      blockers.push(
+        `Ucode ${norm(corp.ucode).toLowerCase()} is already held by ${describeHolder(h)} — auth's EMPLOYEE_ADD ucode check spans admin / field force / counter / delegate / stockist.${await freeItFirstHint(environment, h, "ucode")}`,
+      );
+    }
+  }
+
+  if (blockers.length > 0) {
+    // Informational, not a violation — kept out of `blockers` so it neither
+    // inflates the count in the message nor reads as another collision.
+    warnings.push(
+      `Nothing was sent for ${label}; the events stay on the corp stream and can be replayed once the collisions above are resolved.`,
+    );
+  }
+
+  return { blockers, warnings };
+}
+
+/**
+ * Unlike the corp-sync, a replay cannot be waved through on a "the end state is
+ * fine" argument: the auth CONSUMER runs the uniqueness check itself and will
+ * reject EMPLOYEE_ADD outright, so the number has to be genuinely free first.
+ * When the blocking holder is a field-force employee whose own corp record
+ * disagrees with what it stores, say so — syncing that employee is the way out.
+ */
+async function freeItFirstHint(
+  environment: Environment,
+  h: Holder,
+  column: "mobile_no" | "ucode",
+): Promise<string> {
+  const corpValue = await corpImpliedValue(environment, h, column);
+  if (!corpValue || corpValue === sameFormAs(h.value, column)) return "";
+  return ` That employee's corp value is ${corpValue}, so their auth record is itself stale — run "Sync auth with corp" for ${norm(h.shortCode) || `row ${h.id}`} first to free this value, then replay.`;
 }
 
 /* ---------------------- action 3: sync auth from corp ---------------------- */
@@ -882,6 +997,8 @@ export async function syncAuthFromCorp(
     message,
     authId: "",
     changes: [],
+    blockers: [],
+    warnings: [],
     updated: false,
     preview,
   });
@@ -917,41 +1034,251 @@ export async function syncAuthFromCorp(
       message: "Auth already matches corp on name, mobile and ucode — nothing to sync.",
       authId: auth.id,
       changes: [],
+      blockers: [],
+      warnings: [],
       updated: false,
       preview,
     };
   }
 
+  // Integrity gate: auth enforces mobile and ucode uniqueness ACROSS all five
+  // user tables (admin / field force / counter / delegate / stockist) in
+  // application code, with no DB constraint behind it. Writing straight to the
+  // table bypasses that guard, so replicate it here against the state the sync
+  // would leave behind — a value another record already holds and that this
+  // plan does not free is a hard blocker.
+  const { blockers, warnings } = await checkAuthSyncIntegrity(
+    environment,
+    auth,
+    changes,
+  );
+
   if (preview) {
     return {
       ok: true,
-      message: `Would update ${changes.map((c) => c.label.toLowerCase()).join(", ")} on the auth record from corp.`,
+      message:
+        blockers.length > 0
+          ? `Sync blocked — ${blockers.length} integrity violation${blockers.length === 1 ? "" : "s"} would result from writing ${changes.map((c) => c.label.toLowerCase()).join(", ")}.`
+          : `Would update ${changes.map((c) => c.label.toLowerCase()).join(", ")} on the auth record from corp.`,
       authId: auth.id,
       changes,
+      blockers,
+      warnings,
       updated: false,
       preview: true,
     };
   }
 
+  if (blockers.length > 0) {
+    return { ...fail(`Sync blocked: ${blockers.join(" ")}`), blockers, warnings };
+  }
+
   const pool = getAuthPool(environment);
   const schema = authSchema(environment);
   // Column names come from the fixed allow-list above; values parameterized.
+  // Each column carries a before-value predicate so a row changed since the
+  // preview is skipped rather than clobbered (same discipline as the repair).
   const sets = changes.map((c, i) => `"${c.column}" = $${i + 1}`).join(", ");
   const params: unknown[] = changes.map((c) => c.after);
+  const guards = changes
+    .map((c) => {
+      params.push(c.before);
+      return `"${c.column}" IS NOT DISTINCT FROM $${params.length}`;
+    })
+    .join(" AND ");
   params.push(auth.id);
-  await pool.query(
-    `UPDATE "${schema}"."Field_Force_Users" SET ${sets} WHERE id = $${params.length}::integer`,
+  const res = await pool.query(
+    `UPDATE "${schema}"."Field_Force_Users" SET ${sets}
+      WHERE id = $${params.length}::integer AND ${guards}`,
     params,
   );
+
+  if ((res.rowCount ?? 0) === 0) {
+    return {
+      ...fail(
+        `Auth record ${auth.id} changed since the preview — nothing was written. Re-check and try again.`,
+      ),
+      changes,
+      warnings,
+    };
+  }
 
   return {
     ok: true,
     message: `Updated ${changes.map((c) => c.label.toLowerCase()).join(", ")} on auth record ${auth.id} from corp.`,
     authId: auth.id,
     changes,
+    blockers: [],
+    warnings,
     updated: true,
     preview: false,
   };
+}
+
+/**
+ * Would the corp-sync leave a duplicate behind? Checks each value it would
+ * write against every auth table that auth-backend's own uniqueness chain
+ * walks, excluding the row being written (it is allowed to keep its own
+ * value). `name` carries no invariant.
+ *
+ * The mobile check is run twice: raw equality (what auth actually compares, so
+ * that is the blocker) and last-10 digits (a looser net, since corp stores
+ * numeric(10) and auth varchar — reported as a warning so a formatting-only
+ * clash is visible without blocking a write auth itself would accept).
+ */
+async function checkAuthSyncIntegrity(
+  environment: Environment,
+  auth: AuthRow,
+  changes: CorrectionSyncChange[],
+): Promise<{ blockers: string[]; warnings: string[] }> {
+  const blockers: string[] = [];
+  const warnings: string[] = [];
+  const selfKey = rowKey("auth", "Field_Force_Users", auth.id);
+  const selfLabel = `auth Field_Force_Users row ${auth.id}${norm(auth.short_code) ? ` (${norm(auth.short_code)})` : ""}`;
+
+  const mobileChange = changes.find((c) => c.column === "mobile_no");
+  if (mobileChange?.after) {
+    const holders = (
+      await findMobileHolders(environment, [
+        mobileChange.after,
+        normalizeMobile(mobileChange.after) ?? "",
+      ])
+    ).filter((h) => holderKey(h) !== selfKey);
+    const { assignments, warnings: pending } = await projectPendingCorrections(
+      environment,
+      holders,
+      "mobile_no",
+      { rowKey: selfKey, newValue: mobileChange.after, label: selfLabel },
+    );
+    warnings.push(...pending);
+    blockers.push(
+      ...validateNetUniqueness({
+        label: "Mobile number",
+        assignments,
+        holders,
+        canon: CANON.exact,
+        hint: "auth's EMPLOYEE_EDIT guard would reject this too.",
+      }),
+    );
+    // Loose (last-10) collisions raw equality misses — informational only,
+    // since auth itself compares raw strings and would accept the write.
+    const loose = validateNetUniqueness({
+      label: "Mobile number",
+      assignments,
+      holders,
+      canon: CANON.mobile10,
+      hint: "It differs only in formatting, so auth's raw comparison would not catch it.",
+    }).filter((v) => !blockers.includes(v));
+    warnings.push(...loose);
+  }
+
+  const ucodeChange = changes.find((c) => c.column === "ucode");
+  if (ucodeChange?.after) {
+    const holders = (
+      await findUcodeHolders(environment, [ucodeChange.after])
+    ).filter((h) => holderKey(h) !== selfKey);
+    const { assignments, warnings: pending } = await projectPendingCorrections(
+      environment,
+      holders,
+      "ucode",
+      { rowKey: selfKey, newValue: ucodeChange.after, label: selfLabel },
+    );
+    warnings.push(...pending);
+    blockers.push(
+      ...validateNetUniqueness({
+        label: "Ucode",
+        assignments,
+        holders,
+        canon: CANON.lower,
+        hint: "auth's EMPLOYEE_ADD ucode check spans admin / field force / counter / delegate / stockist.",
+      }),
+    );
+  }
+
+  return { blockers, warnings };
+}
+
+/**
+ * Extends the projected end state with the corrections corp IMPLIES for the
+ * other holders, so a crossed pair can be fixed one employee at a time.
+ *
+ * A sync writes one auth row, but the classic case is two employees whose
+ * details got swapped: auth has A holding B's mobile and vice versa. Syncing A
+ * alone looks like a duplicate at that instant, yet corp — the source of truth
+ * — already says B must move off that number, so the state after both syncs is
+ * unique. Any field-force holder whose corp record disagrees with what it
+ * currently stores is therefore treated as already assigned its corp value
+ * (which un-blocks this sync) and reported as a warning, so the operator knows
+ * the second sync is still outstanding.
+ *
+ * Holders that are NOT field-force employees (counter / stockist / admin /
+ * delegate rows), or whose corp record agrees with what they hold, stay in the
+ * end state and block — nothing is going to move them.
+ */
+async function projectPendingCorrections(
+  environment: Environment,
+  holders: Holder[],
+  column: "mobile_no" | "ucode",
+  self: Assignment,
+): Promise<{ assignments: Assignment[]; warnings: string[] }> {
+  const assignments: Assignment[] = [self];
+  const warnings: string[] = [];
+  for (const h of holders) {
+    const corpValue = await corpImpliedValue(environment, h, column);
+    // Semantic comparison here (last-10 mobile / lowercased ucode): a
+    // formatting-only difference is NOT a pending correction.
+    if (!corpValue || corpValue === sameFormAs(h.value, column)) continue;
+    const shortCode = norm(h.shortCode);
+
+    assignments.push({
+      rowKey: holderKey(h),
+      newValue: corpValue,
+      label: `auth Field_Force_Users row ${h.id} (${shortCode})`,
+    });
+    warnings.push(
+      `${shortCode} also holds ${column === "mobile_no" ? "this mobile" : "this ucode"}, but corp says theirs is ${corpValue} — their details are crossed with this employee's. This sync is allowed because the end state is unique once BOTH are synced; run "Sync auth with corp" for ${shortCode} too (either order works).`,
+    );
+  }
+
+  return { assignments, warnings };
+}
+
+/**
+ * A stored value reduced to the same canonical form `corpImpliedValue` returns,
+ * so the two can be compared without formatting noise (last-10 digits for a
+ * mobile, lowercase for a ucode).
+ */
+function sameFormAs(value: string | null, column: "mobile_no" | "ucode"): string {
+  return column === "mobile_no"
+    ? (normalizeMobile(value) ?? "")
+    : norm(value).toLowerCase();
+}
+
+/**
+ * What corp says this holder's `mobile_no` / `ucode` should be, when that
+ * differs from what the holder currently stores — i.e. the holder is itself
+ * awaiting a correction. Null when the holder is not a field-force employee,
+ * cannot be matched to exactly one corp row, or already agrees with corp.
+ */
+async function corpImpliedValue(
+  environment: Environment,
+  h: Holder,
+  column: "mobile_no" | "ucode",
+): Promise<string | null> {
+  if (h.db !== "auth" || h.table !== "Field_Force_Users") return null;
+  const shortCode = norm(h.shortCode);
+  if (!shortCode) return null;
+
+  const corpRows = (await fetchCorpByShortCode(environment, shortCode)).filter(
+    (c) =>
+      pairKey(c.emp_shortcode, c.company_code) === pairKey(shortCode, h.companyCode),
+  );
+  if (corpRows.length !== 1) return null; // ambiguous or corp-less
+  const corpValue =
+    column === "mobile_no"
+      ? (normalizeMobile(corpRows[0].mobile_no) ?? "")
+      : norm(corpRows[0].ucode).toLowerCase();
+  return corpValue || null;
 }
 
 
@@ -1197,31 +1524,21 @@ export async function repairCognitoLinks(
     /* ---------------- build the step plan ---------------- */
     const steps: CorrectionRepairStep[] = [];
 
-    // 1. Cognito phone updates — "other" users first so a contested mobile is
-    // freed before another account claims it. The only kind of Cognito write.
-    const plannedPhones = new Map<string, string>(); // sub → new mobile
+    // 1. Cognito phone updates — the only kind of Cognito write. Every needed
+    // update is planned unconditionally; whether a contested number actually
+    // works out is decided by the end-state check below (a swap nets out, a
+    // genuine collision blocks the whole repair). "Other" users are still
+    // ordered first so that at APPLY time a contested number is freed before
+    // another account claims it.
     const ordered = [
       ...participants.filter((p) => p.role === "other"),
       ...participants.filter((p) => p.role === "analyzed"),
     ];
     for (const p of ordered) {
       if (!p.account || !p.needsPhone || !p.mobile10) continue;
-      const holders = (await byMobile(p.mobile10)).filter(
-        (u) => norm(u.sub) !== norm(p.account!.sub),
-      );
-      const blocking = holders.filter((u) => {
-        const moved = plannedPhones.get(norm(u.sub));
-        return moved === undefined || moved === p.mobile10;
-      });
-      if (blocking.length > 0) {
-        warnings.push(
-          `Cannot set ${norm(p.corp.emp_shortcode)}'s Cognito mobile to ${p.mobile10} — account ${blocking
-            .map((u) => norm(u.emp_short_code) || norm(u.sub))
-            .join(", ")} already holds it; that update is skipped (repair that user first).`,
-        );
-        p.notes.push("Cognito mobile update skipped — number occupied");
-        continue;
-      }
+      // Make sure every account currently holding the target number is loaded,
+      // so the end-state check can see it.
+      await byMobile(p.mobile10);
       steps.push({
         kind: "cognitoPhone",
         sub: norm(p.account.sub),
@@ -1230,7 +1547,6 @@ export async function repairCognitoLinks(
         before: displayMobile10(p.account.phone_number),
         after: p.mobile10,
       });
-      plannedPhones.set(norm(p.account.sub), p.mobile10);
     }
 
     // 2. cognito_id writes onto each participant's rows (+ missing-in-auth
@@ -1340,6 +1656,25 @@ export async function repairCognitoLinks(
       }
     }
 
+    /* ---------------- projected end-state integrity ---------------- */
+    // The plan is complete; now check the state it would LEAVE BEHIND. This is
+    // deliberately a net check, not a per-statement one: the whole point of the
+    // repair is to un-cross two users, so values legitimately move between
+    // rows. Only a duplicate that survives the plan is a violation.
+    const knownAccounts = new Map<string, CognitoUserInfo>();
+    for (const u of subCache.values()) if (u) knownAccounts.set(norm(u.sub), u);
+    for (const users of mobileCache.values()) {
+      for (const u of users) knownAccounts.set(norm(u.sub), u);
+    }
+    blockers.push(
+      ...(await checkRepairIntegrity(
+        environment,
+        participants,
+        steps,
+        Array.from(knownAccounts.values()),
+      )),
+    );
+
     /* ---------------- result shaping ---------------- */
     const participantsOut: CorrectionRepairParticipant[] = participants.map((p) => ({
       role: p.role,
@@ -1380,7 +1715,7 @@ export async function repairCognitoLinks(
     if (preview) {
       return {
         ok: true,
-        message: `Repair plan for ${participants.length} user${participants.length === 1 ? "" : "s"}: ${summary || "no steps yet"}.${blockers.length > 0 ? " Blocked until the missing auth record(s) are created." : ""}`,
+        message: `Repair plan for ${participants.length} user${participants.length === 1 ? "" : "s"}: ${summary || "no steps yet"}.${blockers.length > 0 ? ` Blocked by ${blockers.length} issue${blockers.length === 1 ? "" : "s"} — see below.` : ""}`,
         participants: participantsOut,
         steps,
         blockers,
@@ -1455,6 +1790,141 @@ export async function repairCognitoLinks(
       preview: false,
     };
   } catch (e) {
-    return fail(describeCognitoError(e));
+    // The repair reads Cognito AND both databases; describeCognitoError would
+    // mislabel a pg failure (e.g. a missing auth table during the integrity
+    // pass) as a ListUsers error. Either way this fails closed — nothing has
+    // been applied at this point.
+    const isCognito =
+      e instanceof CognitoIdentityProviderServiceException ||
+      (e instanceof Error && /Cognito/i.test(e.name));
+    return fail(
+      isCognito
+        ? describeCognitoError(e)
+        : `Repair aborted before any change: ${e instanceof Error ? `${e.name}: ${e.message}` : String(e)}`,
+    );
   }
+}
+
+/**
+ * The repair's projected-end-state gate, run once the step plan is complete.
+ *
+ * Two invariants, both evaluated NET — a criss-cross that untangles cleanly
+ * must pass, only a duplicate that survives the plan may block:
+ *
+ *  1. `cognito_id` identifies exactly one employee. A sub may legitimately sit
+ *     on that employee's own corp `empmaster_hdr` row AND their auth
+ *     `Field_Force_Users` row, so ownership is checked per participant rather
+ *     than per table. Any OTHER record still holding the sub afterwards — in
+ *     any of the five auth user tables or in corp — is a violation, including
+ *     tables this tool cannot write (those must be resolved by hand; failing
+ *     closed is the point).
+ *  2. Cognito `phone_number` is single-holder. The final phone per account is
+ *     the planned update where there is one, otherwise the account's current
+ *     value. Two accounts landing on the same number blocks the whole repair
+ *     rather than silently skipping one update and leaving a half-fixed pair.
+ */
+async function checkRepairIntegrity(
+  environment: Environment,
+  participants: RepairParticipantState[],
+  steps: CorrectionRepairStep[],
+  knownAccounts: CognitoUserInfo[],
+): Promise<string[]> {
+  const blockers: string[] = [];
+  const tableFor = (source: "corp" | "auth") =>
+    source === "corp" ? "empmaster_hdr" : "Field_Force_Users";
+
+  /* ---------------- cognito_id ---------------- */
+
+  // Value each touched row holds after the plan runs (absent = unchanged).
+  const projected = new Map<string, string | null>();
+  for (const st of steps) {
+    if (st.kind === "dbWrite") {
+      projected.set(rowKey(st.source, tableFor(st.source), st.id), st.after);
+    } else if (st.kind === "dbClear") {
+      projected.set(rowKey(st.source, tableFor(st.source), st.id), null);
+    }
+  }
+
+  // Which rows are the rightful owners of each target sub.
+  const ownersBySub = new Map<string, { keys: Set<string>; label: string }>();
+  for (const p of participants) {
+    if (!p.account) continue;
+    const sub = norm(p.account.sub);
+    if (!sub) continue;
+    const label = `${norm(p.corp.emp_shortcode) || "—"} (corp empmaster ${p.corp.empmaster_id})`;
+    const existing = ownersBySub.get(sub);
+    if (existing) {
+      blockers.push(
+        `cognito_id ${sub} resolves as the rightful account of BOTH ${existing.label} and ${label} — two employees cannot share one Cognito account. Analyze each mobile separately and fix the short codes first.`,
+      );
+      continue;
+    }
+    const keys = new Set<string>([
+      rowKey("corp", "empmaster_hdr", p.corp.empmaster_id),
+    ]);
+    if (p.auth) keys.add(rowKey("auth", "Field_Force_Users", p.auth.id));
+    ownersBySub.set(sub, { keys, label });
+  }
+
+  const targetSubs = Array.from(ownersBySub.keys());
+  const holders: Holder[] =
+    targetSubs.length > 0 ? await findCognitoHolders(environment, targetSubs) : [];
+  for (const h of holders) {
+    const owner = ownersBySub.get(norm(h.value));
+    if (!owner) continue;
+    const key = holderKey(h);
+    if (owner.keys.has(key)) continue; // the rightful owner's own row
+    if (projected.has(key) && norm(projected.get(key)) !== norm(h.value)) {
+      continue; // the plan moves this row off the sub
+    }
+    blockers.push(
+      `cognito_id ${norm(h.value)} would still be on ${describeHolder(h)} after the repair, alongside ${owner.label} — a cognito_id must identify exactly one employee. Clear that record first (this tool only writes corp empmaster_hdr and auth Field_Force_Users).`,
+    );
+  }
+
+  /* ---------------- Cognito phone_number ---------------- */
+
+  const desired = new Map<string, string>();
+  for (const st of steps) {
+    if (st.kind === "cognitoPhone") desired.set(norm(st.sub), st.after);
+  }
+
+  const labelForSub = new Map<string, string>();
+  const finalPhone = new Map<string, string>();
+  for (const u of knownAccounts) {
+    const sub = norm(u.sub);
+    if (!sub) continue;
+    labelForSub.set(
+      sub,
+      `${norm(u.emp_short_code) || norm(u.username) || sub}${norm(u.name) ? ` (${norm(u.name)})` : ""}`,
+    );
+    const phone = desired.get(sub) ?? normalizeMobile(u.phone_number) ?? "";
+    if (phone) finalPhone.set(sub, phone);
+  }
+  // An account we plan to write but never loaded (defensive — byMobile /
+  // bySub populate the cache for everything the plan touches).
+  for (const [sub, phone] of desired) {
+    if (!finalPhone.has(sub)) finalPhone.set(sub, phone);
+    if (!labelForSub.has(sub)) labelForSub.set(sub, sub);
+  }
+
+  const subsByPhone = new Map<string, string[]>();
+  for (const [sub, phone] of finalPhone) {
+    const list = subsByPhone.get(phone);
+    if (list) list.push(sub);
+    else subsByPhone.set(phone, [sub]);
+  }
+  for (const [phone, subs] of subsByPhone) {
+    if (subs.length < 2) continue;
+    // Only report when the plan is what puts them there — a pre-existing
+    // duplicate the repair neither creates nor touches is not this run's fault.
+    if (!subs.some((sub) => desired.has(sub))) continue;
+    blockers.push(
+      `Cognito mobile ${phone} would end up on ${subs.length} accounts (${subs
+        .map((sub) => labelForSub.get(sub) ?? sub)
+        .join(", ")}) — a number must identify one account. Repair the other user first, or correct their corp mobile.`,
+    );
+  }
+
+  return blockers;
 }

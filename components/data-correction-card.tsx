@@ -891,7 +891,20 @@ function ConfirmModal({
   const sp = action.syncPreview;
   const xp = action.repairPreview;
   const creating = action.creating;
-  const repairBlocked = isRepair && ((xp?.blockers.length ?? 0) > 0 || Boolean(creating));
+  // Confirm is refused whenever the previewed plan would violate an auth/corp
+  // invariant (duplicate mobile / ucode / cognito_id / Cognito phone) — the
+  // server refuses it too, this just makes it visible before the click.
+  const previewBlockers = isRepair
+    ? (xp?.blockers ?? [])
+    : isSync
+      ? (sp?.blockers ?? [])
+      : (rp?.blockers ?? []);
+  const previewWarnings = isRepair
+    ? (xp?.warnings ?? [])
+    : isSync
+      ? (sp?.warnings ?? [])
+      : (rp?.warnings ?? []);
+  const blocked = previewBlockers.length > 0 || Boolean(creating);
   const stepLabel = (source: "corp" | "auth") =>
     source === "corp" ? "corp empmaster_hdr" : "auth Field_Force_Users";
   return (
@@ -987,6 +1000,10 @@ function ConfirmModal({
               </table>
             </div>
           </>
+        )}
+
+        {!isRepair && (previewBlockers.length > 0 || previewWarnings.length > 0) && (
+          <IntegrityNotices blockers={previewBlockers} warnings={previewWarnings} />
         )}
 
         {isRepair && xp && (
@@ -1204,10 +1221,12 @@ function ConfirmModal({
             type="button"
             className={isProd ? "btn-danger" : "btn-primary"}
             onClick={onConfirm}
-            disabled={repairBlocked}
+            disabled={blocked}
             title={
-              repairBlocked
-                ? "Create the missing auth record(s) first — the confirm unlocks once they exist"
+              blocked
+                ? creating
+                  ? "Creating the missing auth record — the confirm unlocks once it exists"
+                  : "Resolve the listed conflicts first — this would leave duplicate data behind"
                 : undefined
             }
           >
@@ -1220,5 +1239,41 @@ function ConfirmModal({
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * Integrity violations (red — the confirm is disabled while any exist) and
+ * non-blocking cautions (amber) for the replay and sync previews. The repair
+ * modal renders its own blockers block because that one also carries the
+ * "Create <short code> in auth" buttons.
+ */
+function IntegrityNotices({
+  blockers,
+  warnings,
+}: {
+  blockers: string[];
+  warnings: string[];
+}) {
+  return (
+    <>
+      {blockers.length > 0 && (
+        <div className="rounded-lg border border-red-500/40 bg-red-500/5 px-3 py-2 space-y-1 text-xs text-red-600 dark:text-red-400">
+          <p className="font-medium">
+            Blocked — this would leave duplicate data behind:
+          </p>
+          {blockers.map((b, i) => (
+            <p key={i}>{b}</p>
+          ))}
+        </div>
+      )}
+      {warnings.length > 0 && (
+        <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-2 space-y-1 text-[11px] text-amber-700 dark:text-amber-400">
+          {warnings.map((w, i) => (
+            <p key={i}>{w}</p>
+          ))}
+        </div>
+      )}
+    </>
   );
 }

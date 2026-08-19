@@ -481,6 +481,12 @@ export type CorrectionReplayResult = {
   /** Messages actually sent to the auth queue (0 in preview). */
   sent: number;
   errors: { eventId: string; reason: string }[];
+  /** Integrity violations the replay would hit in auth (mobile / short code /
+   * ucode already taken). Confirm is refused while any exists — the replayed
+   * EMPLOYEE_ADD would be rejected by the auth consumer anyway. */
+  blockers: string[];
+  /** Non-blocking cautions (e.g. a last-10-digits-only mobile collision). */
+  warnings: string[];
   preview: boolean;
 };
 
@@ -598,6 +604,12 @@ export type CorrectionSyncResult = {
   /** Auth Field_Force_Users.id being updated. */
   authId: string;
   changes: CorrectionSyncChange[];
+  /** Integrity violations in the projected end state (a mobile or ucode the
+   * sync would write is already held by another user). Confirm is refused
+   * while any exists. */
+  blockers: string[];
+  /** Non-blocking cautions (loose-form collisions, skipped columns). */
+  warnings: string[];
   updated: boolean;
   preview: boolean;
 };
