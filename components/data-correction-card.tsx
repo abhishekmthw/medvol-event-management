@@ -7,6 +7,7 @@ import {
   Check,
   CircleAlert,
   Copy,
+  GitCompareArrows,
   Info,
   Loader2,
   RefreshCw,
@@ -16,6 +17,10 @@ import {
   Wrench,
 } from "lucide-react";
 import { displayMobile10 } from "@/lib/format";
+import {
+  CORRECTION_WRITES_DISABLED_MESSAGE,
+  CORRECTION_WRITES_ENABLED,
+} from "@/lib/write-guard";
 import type {
   CorrectionAnalyzeResult,
   CorrectionEmployee,
@@ -510,21 +515,28 @@ export function DataCorrectionCard({
   return (
     <section className="card p-5 sm:p-6 space-y-5 animate-fade-in">
       <div className="flex items-center gap-2">
-        <Wrench className="h-4 w-4 text-[hsl(var(--primary))]" />
+        <GitCompareArrows className="h-4 w-4 text-[hsl(var(--primary))]" />
         <h2 className="text-sm font-semibold uppercase tracking-wider">
-          Employee Data Correction
+          Compare Auth / Corp / Cognito
         </h2>
-        <span
-          className={clsx(
-            "ml-auto pill",
-            isProd
-              ? "bg-red-500/15 text-red-600 dark:text-red-400"
-              : "bg-amber-500/15 text-amber-700 dark:text-amber-400",
-          )}
-        >
-          <AlertTriangle className="h-3 w-3" />
-          writes on confirm
-        </span>
+        {CORRECTION_WRITES_ENABLED ? (
+          <span
+            className={clsx(
+              "ml-auto pill",
+              isProd
+                ? "bg-red-500/15 text-red-600 dark:text-red-400"
+                : "bg-amber-500/15 text-amber-700 dark:text-amber-400",
+            )}
+          >
+            <AlertTriangle className="h-3 w-3" />
+            writes on confirm
+          </span>
+        ) : (
+          <span className="ml-auto pill bg-sky-500/15 text-sky-600 dark:text-sky-400">
+            <Info className="h-3 w-3" />
+            read-only
+          </span>
+        )}
       </div>
 
       <p className="text-xs text-[hsl(var(--muted-foreground))]">
@@ -532,15 +544,13 @@ export function DataCorrectionCard({
         employee(s) (<code>empmaster_hdr</code>) holding it are checked first,
         then compared against auth and Cognito on <b>short code</b>,{" "}
         <b>mobile</b>, <b>name</b> and <b>ucode</b>. If the employee is missing
-        in auth, its corp event stream (<code>employee_&lt;empmaster id&gt;</code>)
-        can be replayed onto the auth queue to re-create it; if it exists but
-        its name / mobile / ucode drifted, they can be synced onto the auth
-        record from corp; and ANY <b>cognito_id</b> entanglement — mismatched,
-        duplicated, stale or criss-crossed with another user — is fixed by the
-        single <b>Reassign / repair</b> step, which finds both intertwined
-        users (via cognito_id or mobile across all three datasources) and
-        updates them together. Every action previews first and asks for
-        confirmation.
+        in auth, or its name / mobile / ucode drifted, or its <b>cognito_id</b>
+        is mismatched / duplicated / stale / criss-crossed with another user,
+        the comparison says so — including who actually owns each stored
+        cognito_id, resolved live from Cognito by sub.{" "}
+        {CORRECTION_WRITES_ENABLED
+          ? "Every correction previews first and asks for confirmation."
+          : "This view is read-only: it reports the deviations it finds and performs no writes."}
       </p>
 
       <div className="space-y-2">
@@ -577,7 +587,9 @@ export function DataCorrectionCard({
 
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="text-xs text-[hsl(var(--muted-foreground))]">
-          Analyze is read-only; corrections run only after an explicit confirm.
+          {CORRECTION_WRITES_ENABLED
+            ? "Analyze is read-only; corrections run only after an explicit confirm."
+            : CORRECTION_WRITES_DISABLED_MESSAGE}
         </p>
         <div className="flex items-center gap-2">
           {result && (
@@ -613,8 +625,6 @@ export function DataCorrectionCard({
         </div>
       </div>
 
-      <ReservedNumberPanel environment={environment} isProd={isProd} post={post} />
-
       {pollNote && (
         <div className="rounded-lg border border-sky-500/30 bg-sky-500/5 px-3 py-2 text-xs text-sky-700 dark:text-sky-400 flex items-start gap-2 animate-fade-in">
           <Info className="h-3.5 w-3.5 mt-0.5 shrink-0" />
@@ -643,8 +653,9 @@ export function DataCorrectionCard({
         </div>
       )}
 
-      {/* Confirm modal */}
-      {action?.phase === "confirm" && (
+      {/* Confirm modal — never reachable in display-only mode (no action
+          affordance opens it), gated anyway so the write path is one flag. */}
+      {CORRECTION_WRITES_ENABLED && action?.phase === "confirm" && (
         <ConfirmModal
           action={action}
           isProd={isProd}
@@ -664,233 +675,6 @@ export function DataCorrectionCard({
         />
       )}
     </section>
-  );
-}
-
-/* ------------------------ reserved-number panel ------------------------ */
-
-/**
- * "This number cannot be signed up, but Cognito shows nothing" — keyed on the
- * NUMBER, not on an employee, because in this state no analysis can find the
- * account: it holds the number only as a sign-in identifier (the pool is
- * `UsernameAttributes: ['phone_number']`) while its `phone_number` attribute
- * points somewhere else, so it is invisible to every search and to the console.
- *
- * Check is the read-only preview; Release performs the writes. Releasing is
- * preferable to reusing the stale account — once the number is free the normal
- * signup chain runs in full and the new user gets their own `custom:*` and
- * `cognito_id`.
- */
-function ReservedNumberPanel({
-  environment,
-  isProd,
-  post,
-}: {
-  environment: Environment;
-  isProd: boolean;
-  post: <T>(url: string, body: unknown) => Promise<T | null>;
-}) {
-  const [mobile, setMobile] = useState("");
-  const [phase, setPhase] = useState<"idle" | "checking" | "checked" | "running" | "done">(
-    "idle",
-  );
-  const [preview, setPreview] = useState<CorrectionReleaseNumberResult | null>(null);
-  const [result, setResult] = useState<CorrectionReleaseNumberResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
-
-  const busy = phase === "checking" || phase === "running";
-
-  async function run(isPreview: boolean) {
-    setError(null);
-    if (isPreview) {
-      setPreview(null);
-      setResult(null);
-    }
-    setPhase(isPreview ? "checking" : "running");
-    try {
-      const data = await post<CorrectionReleaseNumberResult>(
-        "/api/auth-comparison/correction/release-number",
-        { environment, mobile: mobile.trim(), preview: isPreview },
-      );
-      if (data === null) return;
-      if (isPreview) {
-        setPreview(data);
-        setPhase("checked");
-      } else {
-        setResult(data);
-        setPhase("done");
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      setPhase(isPreview ? "idle" : "checked");
-    }
-  }
-
-  const shown = result ?? preview;
-  const blocked = (preview?.blockers.length ?? 0) > 0 || !preview?.holder;
-
-  return (
-    <div className="rounded-lg border border-[hsl(var(--border))] p-4 space-y-3">
-      <div className="flex items-center gap-2">
-        <KeyRound className="h-4 w-4 text-[hsl(var(--muted-foreground))]" />
-        <p className="text-sm font-semibold">Reserved mobile number</p>
-        <span className="pill bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] ml-auto">
-          Cognito sign-in index
-        </span>
-      </div>
-      <p className="text-xs text-[hsl(var(--muted-foreground))]">
-        For a number that <strong>cannot be signed up</strong> (
-        <code>UsernameExistsException</code>) although no Cognito search — the
-        console included — finds it. The number is still the sign-in identifier
-        of another account whose phone attribute was rewritten. Check identifies
-        that account; Release frees the number so a normal signup can claim it.
-      </p>
-
-      <div className="flex flex-wrap items-center gap-2">
-        <input
-          className="input-base w-44 font-mono text-[13px]"
-          placeholder="10-digit mobile"
-          inputMode="numeric"
-          maxLength={13}
-          value={mobile}
-          onChange={(e) => {
-            setMobile(e.target.value);
-            setPhase("idle");
-            setPreview(null);
-            setResult(null);
-          }}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !busy && mobile.trim()) run(true);
-          }}
-        />
-        <button
-          type="button"
-          className="btn-ghost h-9"
-          onClick={() => run(true)}
-          disabled={busy || !mobile.trim()}
-        >
-          {phase === "checking" ? (
-            <Loader2 className="h-4 w-4 animate-spin" />
-          ) : (
-            <Search className="h-4 w-4" />
-          )}
-          Check
-        </button>
-        {phase !== "idle" && preview?.holder && (
-          <button
-            type="button"
-            className={isProd ? "btn-danger" : "btn-primary"}
-            onClick={() => run(false)}
-            disabled={busy || blocked}
-            title={
-              blocked ? "Resolve the blocker first — see the message below" : undefined
-            }
-          >
-            {phase === "running" ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <Wrench className="h-4 w-4" />
-            )}
-            Release the number
-          </button>
-        )}
-      </div>
-
-      {error && <p className="text-xs text-red-600 dark:text-red-400">{error}</p>}
-
-      {shown && (
-        <div
-          className={clsx(
-            "rounded-lg px-3 py-2 text-xs flex items-start gap-2",
-            shown.blockers.length > 0 || (phase === "done" && !shown.ok)
-              ? "border border-[hsl(var(--danger))]/40 bg-[hsl(var(--danger))]/10 text-[hsl(var(--danger))]"
-              : "border border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400",
-          )}
-        >
-          <Info className="h-3.5 w-3.5 mt-0.5 shrink-0" />
-          <span>{shown.message}</span>
-        </div>
-      )}
-
-      {/* The holder — the account no search can find. */}
-      {shown?.holder && (
-        <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
-          <table className="w-full text-xs">
-            <tbody>
-              <MobileRow
-                label="Reserved by"
-                value={shown.holder.sub ?? shown.holder.username ?? "—"}
-                note={[
-                  shown.holder.name,
-                  shown.holder.shortCode,
-                  shown.holder.status,
-                  shown.holder.enabled === false ? "disabled" : "enabled",
-                ]
-                  .filter(Boolean)
-                  .join(" · ")}
-              />
-              <MobileRow
-                label="Its phone attribute"
-                value={
-                  (shown.holder.attributeMobile10 &&
-                    displayMobile10(shown.holder.attributeMobile10)) ||
-                  "not set"
-                }
-                note={
-                  shown.attributeMatches
-                    ? "same as the number — this account is genuinely using it"
-                    : "different from the number — why no search finds it"
-                }
-              />
-              {shown.owners.length > 0 && (
-                <MobileRow
-                  label="cognito_id stored in"
-                  value={shown.owners
-                    .map(
-                      (o) =>
-                        `${o.db} ${o.table} #${o.id}${o.shortCode ? ` (${o.shortCode})` : ""}`,
-                    )
-                    .join(", ")}
-                />
-              )}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      {(shown?.blockers.length ?? 0) > 0 || (shown?.warnings.length ?? 0) > 0 ? (
-        <IntegrityNotices
-          blockers={shown!.blockers}
-          warnings={shown!.warnings}
-        />
-      ) : null}
-
-      {/* Attempts, in the order they were tried, each verified. */}
-      {result && result.attempts.length > 0 && (
-        <div className="rounded-lg border border-[hsl(var(--border))] px-3 py-2 space-y-1 text-[11px]">
-          <p className="font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wide text-[10px]">
-            Attempts
-          </p>
-          {result.attempts.map((a, i) => (
-            <p
-              key={i}
-              className={clsx(
-                "leading-snug",
-                a.released
-                  ? "text-emerald-700 dark:text-emerald-400"
-                  : "text-amber-700 dark:text-amber-400",
-              )}
-            >
-              {a.released ? "✓" : "✕"} {i + 1}.{" "}
-              {a.kind === "reassert"
-                ? "re-wrote the existing phone attribute"
-                : "moved the phone attribute to a fresh placeholder"}{" "}
-              <span className="font-mono">{a.wrote}</span> — {a.detail}
-            </p>
-          ))}
-        </div>
-      )}
-    </div>
   );
 }
 
@@ -1070,7 +854,7 @@ function EmployeePanel({
         )}
 
       <div className="flex flex-wrap items-center gap-2">
-        {emp.actions.createInAuth && (
+        {CORRECTION_WRITES_ENABLED && emp.actions.createInAuth && (
           <button
             type="button"
             className={isProd ? "btn-danger" : "btn-primary"}
@@ -1083,7 +867,7 @@ function EmployeePanel({
             Create in auth (replay events)
           </button>
         )}
-        {emp.actions.syncAuthFromCorp && (
+        {CORRECTION_WRITES_ENABLED && emp.actions.syncAuthFromCorp && (
           <button
             type="button"
             className={isProd ? "btn-danger" : "btn-primary"}
@@ -1096,7 +880,7 @@ function EmployeePanel({
             Sync auth with corp
           </button>
         )}
-        {emp.actions.repairCognito && (
+        {CORRECTION_WRITES_ENABLED && emp.actions.repairCognito && (
           <button
             type="button"
             className={isProd ? "btn-danger" : "btn-primary"}
@@ -1116,10 +900,13 @@ function EmployeePanel({
         )}
       </div>
 
-      {/* Always available: unlike the actions above this one is not driven by
-          the analysis, because the condition it fixes (a number reserved as a
-          sign-in identifier while its phone attribute says otherwise) is
-          invisible to every attribute-based check the analysis runs. */}
+      {/* Unlike the actions above this one is not driven by the analysis,
+          because the condition it fixes (a number reserved as a sign-in
+          identifier while its phone attribute says otherwise) is invisible to
+          every attribute-based check the analysis runs. Hidden in display-only
+          mode; the standalone "Reserved mobile number" card covers the
+          read/release path operators actually use. */}
+      {CORRECTION_WRITES_ENABLED && (
       <div className="rounded-lg border border-[hsl(var(--border))] px-3 py-2.5 space-y-2">
         <p className="text-[11px] font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wide text-[10px]">
           Change Cognito mobile / release reserved number
@@ -1157,12 +944,12 @@ function EmployeePanel({
           you are asking for.
         </p>
       </div>
+      )}
 
       {emp.actions.cognitoAttributeDrift && (
         <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
-          Note: the Cognito user&apos;s name/ucode differ from corp. The only
-          Cognito attribute this tool ever writes is the mobile number — fix
-          name/ucode in Cognito manually if needed.
+          Note: the Cognito user&apos;s name/ucode differ from corp. Nothing
+          here rewrites them — fix name/ucode in Cognito manually if needed.
         </p>
       )}
     </div>

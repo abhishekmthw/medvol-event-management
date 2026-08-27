@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { repairCognitoLinks } from "@/lib/correction";
 import type { Environment } from "@/lib/types";
+import { assertCorrectionWritesEnabled } from "@/lib/write-guard";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -32,6 +33,11 @@ export async function POST(req: Request) {
   if (!/^\d+$/.test(empmasterId)) {
     return NextResponse.json({ error: "Invalid empmaster id." }, { status: 400 });
   }
+
+  // Display-only mode: a preview may run, an actual write may not.
+  // Enforced here as well as in the UI so a hand-crafted POST is refused.
+  const blocked = assertCorrectionWritesEnabled(preview);
+  if (blocked) return blocked;
 
   try {
     const result = await repairCognitoLinks(environment, empmasterId, preview);
