@@ -10,6 +10,8 @@ import {
   Info,
   Loader2,
   RefreshCw,
+  KeyRound,
+  Phone,
   Search,
   Wrench,
 } from "lucide-react";
@@ -18,6 +20,8 @@ import type {
   CorrectionAnalyzeResult,
   CorrectionEmployee,
   CorrectionField,
+  CorrectionMobileChangeResult,
+  CorrectionReleaseNumberResult,
   CorrectionRepairResult,
   CorrectionReplayResult,
   CorrectionSyncResult,
@@ -39,9 +43,18 @@ import type {
  *      (via cognito_id or mobile across all three datasources) and repairs
  *      both in one confirmed run; participants missing in auth get a create
  *      button inside the modal first.
+ *   4. Change Cognito mobile / release number → the only tool that reads
+ *      Cognito's sign-in RESERVATION index (`AdminGetUser`) as well as the
+ *      phone attribute, so it can show why a number that appears free is
+ *      rejected as already taken, repoint the employee's account, and — on
+ *      explicit opt-in — release the number from the account squatting on it.
+ *
+ * Plus one card-level tool that is keyed on a NUMBER rather than an employee:
+ * "Reserved mobile number", for the case where a number cannot be signed up
+ * even though nothing in Cognito appears to hold it.
  */
 
-type ActionKind = "replay" | "sync" | "repair";
+type ActionKind = "replay" | "sync" | "repair" | "mobileChange";
 
 type ActionState = {
   kind: ActionKind;
@@ -54,6 +67,12 @@ type ActionState = {
   syncResult?: CorrectionSyncResult;
   repairPreview?: CorrectionRepairResult;
   repairResult?: CorrectionRepairResult;
+  mobilePreview?: CorrectionMobileChangeResult;
+  mobileResult?: CorrectionMobileChangeResult;
+  /** The 10-digit number being set (normalized), carried preview → confirm. */
+  mobileNew?: string;
+  /** Operator opted in to freeing the number from the account holding it. */
+  releaseConflicting?: boolean;
   /** empmasterId of the participant being created in auth from the repair modal. */
   creating?: string;
   error?: string;
@@ -257,6 +276,105 @@ export function DataCorrectionCard({
       );
       if (run === null) return;
       setAction((a) => a && { ...a, phase: "done", syncResult: run });
+      await analyze(true);
+    } catch (e) {
+      setAction(
+        (a) =>
+          a && {
+            ...a,
+            phase: "done",
+            error: e instanceof Error ? e.message : String(e),
+          },
+      );
+    }
+  }
+
+  /* ------------- change Cognito mobile / release reserved number ------------- */
+
+  async function previewMobileChange(
+    empmasterId: string,
+    shortCode: string,
+    newMobile10: string,
+    releaseConflicting: boolean,
+  ) {
+    setPollNote(null);
+    setAction({
+      kind: "mobileChange",
+      empmasterId,
+      shortCode,
+      phase: "previewing",
+      mobileNew: newMobile10,
+      releaseConflicting,
+    });
+    try {
+      const preview = await post<CorrectionMobileChangeResult>(
+        "/api/auth-comparison/correction/mobile-change",
+        {
+          environment,
+          empmasterId,
+          newMobile: newMobile10,
+          releaseConflicting,
+          preview: true,
+        },
+      );
+      if (preview === null) return;
+      if (!preview.ok) {
+        setAction((a) => a && { ...a, phase: "done", error: preview.message });
+        return;
+      }
+      setAction((a) => a && { ...a, phase: "confirm", mobilePreview: preview });
+    } catch (e) {
+      setAction(
+        (a) =>
+          a && {
+            ...a,
+            phase: "done",
+            error: e instanceof Error ? e.message : String(e),
+          },
+      );
+    }
+  }
+
+  async function startMobileChange(emp: CorrectionEmployee, input: string) {
+    const digits = input.replace(/\D/g, "");
+    const newMobile10 = digits.length > 10 ? digits.slice(-10) : digits;
+    if (!/^\d{10}$/.test(newMobile10)) {
+      setTopError(
+        "Enter a valid 10-digit mobile number to set on the Cognito account.",
+      );
+      return;
+    }
+    setTopError(null);
+    await previewMobileChange(emp.empmasterId, emp.shortCode, newMobile10, false);
+  }
+
+  /** Re-preview with the release of the squatting account opted in. */
+  async function optInReleaseAndRepreview() {
+    if (!action || action.kind !== "mobileChange" || !action.mobileNew) return;
+    await previewMobileChange(
+      action.empmasterId,
+      action.shortCode,
+      action.mobileNew,
+      true,
+    );
+  }
+
+  async function confirmMobileChange() {
+    if (!action || action.kind !== "mobileChange" || !action.mobileNew) return;
+    setAction({ ...action, phase: "running" });
+    try {
+      const run = await post<CorrectionMobileChangeResult>(
+        "/api/auth-comparison/correction/mobile-change",
+        {
+          environment,
+          empmasterId: action.empmasterId,
+          newMobile: action.mobileNew,
+          releaseConflicting: action.releaseConflicting === true,
+          preview: false,
+        },
+      );
+      if (run === null) return;
+      setAction((a) => a && { ...a, phase: "done", mobileResult: run });
       await analyze(true);
     } catch (e) {
       setAction(
@@ -495,6 +613,8 @@ export function DataCorrectionCard({
         </div>
       </div>
 
+      <ReservedNumberPanel environment={environment} isProd={isProd} post={post} />
+
       {pollNote && (
         <div className="rounded-lg border border-sky-500/30 bg-sky-500/5 px-3 py-2 text-xs text-sky-700 dark:text-sky-400 flex items-start gap-2 animate-fade-in">
           <Info className="h-3.5 w-3.5 mt-0.5 shrink-0" />
@@ -517,6 +637,7 @@ export function DataCorrectionCard({
               onCreateInAuth={() => startReplay(emp)}
               onSyncAuth={() => startSync(emp)}
               onRepair={() => startRepair(emp)}
+              onChangeMobile={(input) => startMobileChange(emp, input)}
             />
           ))}
         </div>
@@ -534,12 +655,242 @@ export function DataCorrectionCard({
               ? confirmReplay
               : action.kind === "sync"
                 ? confirmSync
-                : confirmRepair
+                : action.kind === "mobileChange"
+                  ? confirmMobileChange
+                  : confirmRepair
           }
           onCreateParticipant={createParticipantInAuth}
+          onOptInRelease={optInReleaseAndRepreview}
         />
       )}
     </section>
+  );
+}
+
+/* ------------------------ reserved-number panel ------------------------ */
+
+/**
+ * "This number cannot be signed up, but Cognito shows nothing" — keyed on the
+ * NUMBER, not on an employee, because in this state no analysis can find the
+ * account: it holds the number only as a sign-in identifier (the pool is
+ * `UsernameAttributes: ['phone_number']`) while its `phone_number` attribute
+ * points somewhere else, so it is invisible to every search and to the console.
+ *
+ * Check is the read-only preview; Release performs the writes. Releasing is
+ * preferable to reusing the stale account — once the number is free the normal
+ * signup chain runs in full and the new user gets their own `custom:*` and
+ * `cognito_id`.
+ */
+function ReservedNumberPanel({
+  environment,
+  isProd,
+  post,
+}: {
+  environment: Environment;
+  isProd: boolean;
+  post: <T>(url: string, body: unknown) => Promise<T | null>;
+}) {
+  const [mobile, setMobile] = useState("");
+  const [phase, setPhase] = useState<"idle" | "checking" | "checked" | "running" | "done">(
+    "idle",
+  );
+  const [preview, setPreview] = useState<CorrectionReleaseNumberResult | null>(null);
+  const [result, setResult] = useState<CorrectionReleaseNumberResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const busy = phase === "checking" || phase === "running";
+
+  async function run(isPreview: boolean) {
+    setError(null);
+    if (isPreview) {
+      setPreview(null);
+      setResult(null);
+    }
+    setPhase(isPreview ? "checking" : "running");
+    try {
+      const data = await post<CorrectionReleaseNumberResult>(
+        "/api/auth-comparison/correction/release-number",
+        { environment, mobile: mobile.trim(), preview: isPreview },
+      );
+      if (data === null) return;
+      if (isPreview) {
+        setPreview(data);
+        setPhase("checked");
+      } else {
+        setResult(data);
+        setPhase("done");
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      setPhase(isPreview ? "idle" : "checked");
+    }
+  }
+
+  const shown = result ?? preview;
+  const blocked = (preview?.blockers.length ?? 0) > 0 || !preview?.holder;
+
+  return (
+    <div className="rounded-lg border border-[hsl(var(--border))] p-4 space-y-3">
+      <div className="flex items-center gap-2">
+        <KeyRound className="h-4 w-4 text-[hsl(var(--muted-foreground))]" />
+        <p className="text-sm font-semibold">Reserved mobile number</p>
+        <span className="pill bg-[hsl(var(--muted))] text-[hsl(var(--muted-foreground))] ml-auto">
+          Cognito sign-in index
+        </span>
+      </div>
+      <p className="text-xs text-[hsl(var(--muted-foreground))]">
+        For a number that <strong>cannot be signed up</strong> (
+        <code>UsernameExistsException</code>) although no Cognito search — the
+        console included — finds it. The number is still the sign-in identifier
+        of another account whose phone attribute was rewritten. Check identifies
+        that account; Release frees the number so a normal signup can claim it.
+      </p>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          className="input-base w-44 font-mono text-[13px]"
+          placeholder="10-digit mobile"
+          inputMode="numeric"
+          maxLength={13}
+          value={mobile}
+          onChange={(e) => {
+            setMobile(e.target.value);
+            setPhase("idle");
+            setPreview(null);
+            setResult(null);
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !busy && mobile.trim()) run(true);
+          }}
+        />
+        <button
+          type="button"
+          className="btn-ghost h-9"
+          onClick={() => run(true)}
+          disabled={busy || !mobile.trim()}
+        >
+          {phase === "checking" ? (
+            <Loader2 className="h-4 w-4 animate-spin" />
+          ) : (
+            <Search className="h-4 w-4" />
+          )}
+          Check
+        </button>
+        {phase !== "idle" && preview?.holder && (
+          <button
+            type="button"
+            className={isProd ? "btn-danger" : "btn-primary"}
+            onClick={() => run(false)}
+            disabled={busy || blocked}
+            title={
+              blocked ? "Resolve the blocker first — see the message below" : undefined
+            }
+          >
+            {phase === "running" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Wrench className="h-4 w-4" />
+            )}
+            Release the number
+          </button>
+        )}
+      </div>
+
+      {error && <p className="text-xs text-red-600 dark:text-red-400">{error}</p>}
+
+      {shown && (
+        <div
+          className={clsx(
+            "rounded-lg px-3 py-2 text-xs flex items-start gap-2",
+            shown.blockers.length > 0 || (phase === "done" && !shown.ok)
+              ? "border border-[hsl(var(--danger))]/40 bg-[hsl(var(--danger))]/10 text-[hsl(var(--danger))]"
+              : "border border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400",
+          )}
+        >
+          <Info className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+          <span>{shown.message}</span>
+        </div>
+      )}
+
+      {/* The holder — the account no search can find. */}
+      {shown?.holder && (
+        <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
+          <table className="w-full text-xs">
+            <tbody>
+              <MobileRow
+                label="Reserved by"
+                value={shown.holder.sub ?? shown.holder.username ?? "—"}
+                note={[
+                  shown.holder.name,
+                  shown.holder.shortCode,
+                  shown.holder.status,
+                  shown.holder.enabled === false ? "disabled" : "enabled",
+                ]
+                  .filter(Boolean)
+                  .join(" · ")}
+              />
+              <MobileRow
+                label="Its phone attribute"
+                value={
+                  (shown.holder.attributeMobile10 &&
+                    displayMobile10(shown.holder.attributeMobile10)) ||
+                  "not set"
+                }
+                note={
+                  shown.attributeMatches
+                    ? "same as the number — this account is genuinely using it"
+                    : "different from the number — why no search finds it"
+                }
+              />
+              {shown.owners.length > 0 && (
+                <MobileRow
+                  label="cognito_id stored in"
+                  value={shown.owners
+                    .map(
+                      (o) =>
+                        `${o.db} ${o.table} #${o.id}${o.shortCode ? ` (${o.shortCode})` : ""}`,
+                    )
+                    .join(", ")}
+                />
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {(shown?.blockers.length ?? 0) > 0 || (shown?.warnings.length ?? 0) > 0 ? (
+        <IntegrityNotices
+          blockers={shown!.blockers}
+          warnings={shown!.warnings}
+        />
+      ) : null}
+
+      {/* Attempts, in the order they were tried, each verified. */}
+      {result && result.attempts.length > 0 && (
+        <div className="rounded-lg border border-[hsl(var(--border))] px-3 py-2 space-y-1 text-[11px]">
+          <p className="font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wide text-[10px]">
+            Attempts
+          </p>
+          {result.attempts.map((a, i) => (
+            <p
+              key={i}
+              className={clsx(
+                "leading-snug",
+                a.released
+                  ? "text-emerald-700 dark:text-emerald-400"
+                  : "text-amber-700 dark:text-amber-400",
+              )}
+            >
+              {a.released ? "✓" : "✕"} {i + 1}.{" "}
+              {a.kind === "reassert"
+                ? "re-wrote the existing phone attribute"
+                : "moved the phone attribute to a fresh placeholder"}{" "}
+              <span className="font-mono">{a.wrote}</span> — {a.detail}
+            </p>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -553,6 +904,7 @@ function EmployeePanel({
   onCreateInAuth,
   onSyncAuth,
   onRepair,
+  onChangeMobile,
 }: {
   emp: CorrectionEmployee;
   isProd: boolean;
@@ -561,8 +913,10 @@ function EmployeePanel({
   onCreateInAuth: () => void;
   onSyncAuth: () => void;
   onRepair: () => void;
+  onChangeMobile: (input: string) => void;
 }) {
   const working = action?.phase === "previewing" || action?.phase === "running";
+  const [newMobile, setNewMobile] = useState("");
   return (
     <div className="rounded-lg border border-[hsl(var(--border))] p-4 space-y-3">
       <div className="flex flex-wrap items-center gap-2">
@@ -670,7 +1024,8 @@ function EmployeePanel({
             action.error ||
               (action.kind === "replay" && !action.replayResult?.ok) ||
               (action.kind === "sync" && !action.syncResult?.ok) ||
-              (action.kind === "repair" && !action.repairResult?.ok)
+              (action.kind === "repair" && !action.repairResult?.ok) ||
+              (action.kind === "mobileChange" && !action.mobileResult?.ok)
               ? "border border-[hsl(var(--danger))]/40 bg-[hsl(var(--danger))]/10 text-[hsl(var(--danger))]"
               : "border border-emerald-500/30 bg-emerald-500/5 text-emerald-700 dark:text-emerald-400",
           )}
@@ -682,10 +1037,37 @@ function EmployeePanel({
                 ? action.replayResult?.message
                 : action.kind === "sync"
                   ? action.syncResult?.message
-                  : action.repairResult?.message)}
+                  : action.kind === "mobileChange"
+                    ? action.mobileResult?.message
+                    : action.repairResult?.message)}
           </span>
         </div>
       )}
+
+      {/* Post-run verification outcomes — the only record that the writes did
+          what they claimed (this app has no audit table). */}
+      {action?.phase === "done" &&
+        action.kind === "mobileChange" &&
+        (action.mobileResult?.verifications.length ?? 0) > 0 && (
+          <div className="rounded-lg border border-[hsl(var(--border))] px-3 py-2 space-y-1 text-[11px]">
+            <p className="font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wide text-[10px]">
+              Verification
+            </p>
+            {action.mobileResult!.verifications.map((v, i) => (
+              <p
+                key={i}
+                className={clsx(
+                  "leading-snug",
+                  v.ok
+                    ? "text-emerald-700 dark:text-emerald-400"
+                    : "text-amber-700 dark:text-amber-400",
+                )}
+              >
+                {v.ok ? "✓" : "✕"} {v.label} — {v.detail}
+              </p>
+            ))}
+          </div>
+        )}
 
       <div className="flex flex-wrap items-center gap-2">
         {emp.actions.createInAuth && (
@@ -732,6 +1114,48 @@ function EmployeePanel({
             auth sync blocked: {emp.actions.syncAuthBlockedReason}
           </span>
         )}
+      </div>
+
+      {/* Always available: unlike the actions above this one is not driven by
+          the analysis, because the condition it fixes (a number reserved as a
+          sign-in identifier while its phone attribute says otherwise) is
+          invisible to every attribute-based check the analysis runs. */}
+      <div className="rounded-lg border border-[hsl(var(--border))] px-3 py-2.5 space-y-2">
+        <p className="text-[11px] font-medium text-[hsl(var(--muted-foreground))] uppercase tracking-wide text-[10px]">
+          Change Cognito mobile / release reserved number
+        </p>
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            className="input-base w-40 font-mono text-[13px]"
+            placeholder="new 10-digit mobile"
+            inputMode="numeric"
+            maxLength={13}
+            value={newMobile}
+            onChange={(e) => setNewMobile(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !busy) onChangeMobile(newMobile);
+            }}
+          />
+          <button
+            type="button"
+            className={isProd ? "btn-danger" : "btn-primary"}
+            onClick={() => onChangeMobile(newMobile)}
+            disabled={busy || !newMobile.trim()}
+          >
+            {working && action?.kind === "mobileChange" ? (
+              <Loader2 className="h-4 w-4 animate-spin" />
+            ) : (
+              <Phone className="h-4 w-4" />
+            )}
+            Preview change
+          </button>
+        </div>
+        <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
+          Writes Cognito only — corp/auth <code>mobile_no</code> stay owned by
+          the event pipeline. The preview shows the account&apos;s reserved
+          sign-in number next to its phone attribute, and who holds the number
+          you are asking for.
+        </p>
       </div>
 
       {emp.actions.cognitoAttributeDrift && (
@@ -876,6 +1300,7 @@ function ConfirmModal({
   onCancel,
   onConfirm,
   onCreateParticipant,
+  onOptInRelease,
 }: {
   action: ActionState;
   isProd: boolean;
@@ -883,13 +1308,16 @@ function ConfirmModal({
   onCancel: () => void;
   onConfirm: () => void;
   onCreateParticipant: (empmasterId: string) => void;
+  onOptInRelease: () => void;
 }) {
   const isReplay = action.kind === "replay";
   const isSync = action.kind === "sync";
   const isRepair = action.kind === "repair";
+  const isMobile = action.kind === "mobileChange";
   const rp = action.replayPreview;
   const sp = action.syncPreview;
   const xp = action.repairPreview;
+  const mp = action.mobilePreview;
   const creating = action.creating;
   // Confirm is refused whenever the previewed plan would violate an auth/corp
   // invariant (duplicate mobile / ucode / cognito_id / Cognito phone) — the
@@ -898,12 +1326,16 @@ function ConfirmModal({
     ? (xp?.blockers ?? [])
     : isSync
       ? (sp?.blockers ?? [])
-      : (rp?.blockers ?? []);
+      : isMobile
+        ? (mp?.blockers ?? [])
+        : (rp?.blockers ?? []);
   const previewWarnings = isRepair
     ? (xp?.warnings ?? [])
     : isSync
       ? (sp?.warnings ?? [])
-      : (rp?.warnings ?? []);
+      : isMobile
+        ? (mp?.warnings ?? [])
+        : (rp?.warnings ?? []);
   const blocked = previewBlockers.length > 0 || Boolean(creating);
   const stepLabel = (source: "corp" | "auth") =>
     source === "corp" ? "corp empmaster_hdr" : "auth Field_Force_Users";
@@ -922,7 +1354,9 @@ function ConfirmModal({
               ? `Replay events to auth — ${action.shortCode}`
               : isSync
                 ? `Sync auth with corp — ${action.shortCode}`
-                : `Reassign / repair cognito_id — ${action.shortCode}`}
+                : isMobile
+                  ? `Change Cognito mobile — ${action.shortCode}`
+                  : `Reassign / repair cognito_id — ${action.shortCode}`}
           </h3>
           <span
             className={clsx(
@@ -999,6 +1433,178 @@ function ConfirmModal({
                 </tbody>
               </table>
             </div>
+          </>
+        )}
+
+        {isMobile && mp && (
+          <>
+            <p className="text-xs text-[hsl(var(--muted-foreground))]">
+              The account was resolved{" "}
+              {mp.targetVia === "sub"
+                ? "from the stored cognito_id"
+                : mp.targetVia === "mobile"
+                  ? "by its phone attribute"
+                  : "ONLY through Cognito's sign-in reservation index"}
+              . Cognito keeps two separate views of a mobile: the{" "}
+              <strong>reserved sign-in number</strong> fixed at signup (what
+              makes a new signup fail as “already exists”) and the{" "}
+              <strong>phone attribute</strong> (what every search and the
+              console show). Where they disagree, only this table tells you.
+            </p>
+            <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
+              <table className="w-full text-xs">
+                <tbody>
+                  <MobileRow
+                    label="Cognito account"
+                    value={mp.target?.sub ?? "—"}
+                    note={[
+                      mp.target?.shortCode,
+                      mp.target?.status,
+                      mp.target?.enabled === false ? "disabled" : null,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  />
+                  <MobileRow
+                    label="Phone attribute (searchable)"
+                    value={
+                      (mp.oldMobile10 && displayMobile10(mp.oldMobile10)) || "—"
+                    }
+                  />
+                  <MobileRow
+                    label={`Reserves ${mp.oldMobile10 ? displayMobile10(mp.oldMobile10) : "its old number"}?`}
+                    value={mp.oldNumberHolder ? "yes — still held" : "no"}
+                    note={
+                      mp.oldNumberHolder
+                        ? (mp.oldNumberHolder.sub ?? "")
+                        : undefined
+                    }
+                  />
+                  <MobileRow
+                    label="New number"
+                    value={displayMobile10(mp.newMobile10) ?? mp.newMobile10}
+                  />
+                  <MobileRow
+                    label="New number reserved by"
+                    value={
+                      mp.newNumberHolder
+                        ? mp.newNumberHolder.sub === mp.target?.sub
+                          ? "this same account"
+                          : "ANOTHER account"
+                        : "nobody"
+                    }
+                    note={
+                      mp.newNumberHolder &&
+                      mp.newNumberHolder.sub !== mp.target?.sub
+                        ? [
+                            mp.newNumberHolder.sub,
+                            mp.newNumberHolder.shortCode,
+                            mp.newNumberHolder.status,
+                            mp.newNumberHolder.enabled === false
+                              ? "disabled"
+                              : null,
+                          ]
+                            .filter(Boolean)
+                            .join(" · ")
+                        : undefined
+                    }
+                  />
+                  <MobileRow
+                    label="DB mobile (corp / auth, not written)"
+                    value={`${mp.dbMobile10.corp ? displayMobile10(mp.dbMobile10.corp) : "—"} / ${mp.dbMobile10.auth ? displayMobile10(mp.dbMobile10.auth) : "—"}`}
+                  />
+                </tbody>
+              </table>
+            </div>
+
+            {mp.steps.length > 0 && (
+              <div className="rounded-lg border border-[hsl(var(--border))] overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
+                    <tr>
+                      <th className="text-left font-medium px-3 py-1.5">#</th>
+                      <th className="text-left font-medium px-3 py-1.5">Step</th>
+                      <th className="text-left font-medium px-3 py-1.5">Target</th>
+                      <th className="text-left font-medium px-3 py-1.5">Effect</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {mp.steps.map((st, i) => (
+                      <tr
+                        key={i}
+                        className="border-t border-[hsl(var(--border))] align-top"
+                      >
+                        <td className="px-3 py-1.5">{i + 1}</td>
+                        {st.kind === "cognitoRelease" ? (
+                          <>
+                            <td className="px-3 py-1.5 whitespace-nowrap text-red-600 dark:text-red-400">
+                              release number
+                            </td>
+                            <td className="px-3 py-1.5">
+                              <span className="font-mono">
+                                {st.shortCode || "—"}
+                              </span>
+                              <span className="block text-[10px] font-mono text-[hsl(var(--muted-foreground))] break-all">
+                                {st.sub}
+                              </span>
+                            </td>
+                            <td className="px-3 py-1.5">
+                              parks a random placeholder number on it and
+                              disables the account, freeing{" "}
+                              <span className="font-mono">
+                                {displayMobile10(st.mobile10)}
+                              </span>
+                            </td>
+                          </>
+                        ) : (
+                          <>
+                            <td className="px-3 py-1.5 whitespace-nowrap">
+                              phone attribute
+                            </td>
+                            <td className="px-3 py-1.5">
+                              <span className="font-mono">
+                                {st.shortCode || "—"}
+                              </span>
+                              <span className="block text-[10px] font-mono text-[hsl(var(--muted-foreground))] break-all">
+                                {st.sub}
+                              </span>
+                            </td>
+                            <td className="px-3 py-1.5 font-mono">
+                              {st.before ? displayMobile10(st.before) : "—"} →{" "}
+                              <span className="text-emerald-700 dark:text-emerald-400">
+                                {displayMobile10(st.after)}
+                              </span>
+                            </td>
+                          </>
+                        )}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {/* The number is squatted and the operator has not opted in yet —
+                offer the release explicitly rather than doing it silently. */}
+            {mp.newNumberHolder &&
+              mp.newNumberHolder.sub !== mp.target?.sub &&
+              action.releaseConflicting !== true && (
+                <button
+                  type="button"
+                  className="btn-ghost h-9 text-xs"
+                  onClick={onOptInRelease}
+                >
+                  <Wrench className="h-3.5 w-3.5" />
+                  Release {displayMobile10(mp.newMobile10)} from that account
+                  and re-preview
+                </button>
+              )}
+
+            <p className="text-[11px] text-[hsl(var(--muted-foreground))]">
+              Every write is re-probed afterwards and the result is reported
+              per check — a release that did not actually free the number is
+              shown as failed, and the employee is not repointed.
+            </p>
           </>
         )}
 
@@ -1234,11 +1840,40 @@ function ConfirmModal({
               ? "Confirm replay"
               : isSync
                 ? "Confirm sync"
-                : "Confirm repair"}
+                : isMobile
+                  ? "Confirm change"
+                  : "Confirm repair"}
           </button>
         </div>
       </div>
     </div>
+  );
+}
+
+/** One label/value line of the mobile-change preview table. */
+function MobileRow({
+  label,
+  value,
+  note,
+}: {
+  label: string;
+  value: string;
+  note?: string;
+}) {
+  return (
+    <tr className="border-t border-[hsl(var(--border))] first:border-t-0">
+      <td className="px-3 py-1.5 whitespace-nowrap text-[hsl(var(--muted-foreground))]">
+        {label}
+      </td>
+      <td className="px-3 py-1.5 font-mono break-all">
+        {value}
+        {note ? (
+          <span className="block text-[10px] font-sans text-[hsl(var(--muted-foreground))] break-all">
+            {note}
+          </span>
+        ) : null}
+      </td>
+    </tr>
   );
 }
 

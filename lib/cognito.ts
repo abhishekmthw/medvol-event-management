@@ -1,8 +1,11 @@
 import {
+  AdminDisableUserCommand,
+  AdminGetUserCommand,
   AdminUpdateUserAttributesCommand,
   CognitoIdentityProviderClient,
   CognitoIdentityProviderServiceException,
   ListUsersCommand,
+  type AdminGetUserCommandOutput,
   type UserType,
 } from "@aws-sdk/client-cognito-identity-provider";
 import type { CognitoUserInfo, Environment } from "./types";
@@ -16,11 +19,19 @@ import type { CognitoUserInfo, Environment } from "./types";
  * actions); only the user-pool id is Cognito-specific
  * (`{ENV}_COGNITO_USERPOOL_ID`).
  *
- * Reads are `ListUsers` only. The single write is `updateUserPhone`
- * (AdminUpdateUserAttributes: phone_number + phone_number_verified) used by
- * the Data Correction card's confirmed "Update Cognito mobile from corp"
- * action — it mirrors auth-backend's own `updateCognitoUserPhoneNumber`.
- * The IAM credentials need `cognito-idp:AdminUpdateUserAttributes` for it.
+ * Reads: `lookupByMobile` / `lookupBySub` (`ListUsers`, attribute filters) and
+ * `lookupByReservedMobile` (`AdminGetUser`) — the last one is the only read
+ * that can see which account a mobile is RESERVED for as a sign-in identifier,
+ * which is a different question from which account carries it as an attribute.
+ * See its doc comment; the difference is why a number can be unusable while
+ * appearing free in every search.
+ *
+ * Writes: `updateUserPhone` (AdminUpdateUserAttributes: phone_number +
+ * phone_number_verified) and `releaseUserPhone` (randomize → update → disable,
+ * then verify), both mirroring auth-backend's own release sequence.
+ *
+ * IAM needs `cognito-idp:ListUsers`, `AdminGetUser`,
+ * `AdminUpdateUserAttributes` and `AdminDisableUser`.
  */
 
 const DEFAULT_REGION = "ap-south-1";
@@ -69,10 +80,14 @@ function getClient(cfg: CognitoConfig): CognitoIdentityProviderClient {
   return client;
 }
 
-function parseUser(u: UserType): CognitoUserInfo {
-  const attrs = new Map(
-    (u.Attributes ?? []).map((a) => [a.Name ?? "", a.Value ?? ""]),
-  );
+function parseUser(u: UserType | AdminGetUserCommandOutput): CognitoUserInfo {
+  // ListUsers returns `Attributes`; AdminGetUser returns the same list as
+  // `UserAttributes` — otherwise the two shapes carry identical fields.
+  const attrList =
+    "Attributes" in u && u.Attributes
+      ? u.Attributes
+      : ((u as AdminGetUserCommandOutput).UserAttributes ?? []);
+  const attrs = new Map(attrList.map((a) => [a.Name ?? "", a.Value ?? ""]));
   return {
     sub: attrs.get("sub") || null,
     name: attrs.get("name") || null,
@@ -130,6 +145,125 @@ export async function lookupBySub(
 }
 
 /**
+ * The user this mobile is RESERVED for as a sign-in identifier — which is not
+ * the same question `lookupByMobile` answers.
+ *
+ * The pool is configured `UsernameAttributes: ['phone_number']`, so the number
+ * supplied at sign-up becomes the account's sign-in identifier and is held in
+ * an internal index; `Username` itself is an opaque UUID. `ListUsers` can only
+ * filter on the `phone_number` ATTRIBUTE, so once that attribute is rewritten
+ * (e.g. by auth-backend's randomize-then-disable release) the account becomes
+ * invisible to `lookupByMobile` while STILL reserving the number — every
+ * `SignUp`/`AdminCreateUser` for it fails with `UsernameExistsException` and no
+ * attribute search explains why.
+ *
+ * `AdminGetUser` resolves that internal index, so this is the only read that
+ * can see a reserved holder. Returns `null` when the number is genuinely free.
+ */
+export async function lookupByReservedMobile(
+  environment: Environment,
+  mobile10: string,
+): Promise<CognitoUserInfo | null> {
+  const cfg = resolveConfig(environment);
+  const client = getClient(cfg);
+  try {
+    const res = await client.send(
+      new AdminGetUserCommand({
+        UserPoolId: cfg.userPoolId,
+        Username: `+91${mobile10}`,
+      }),
+    );
+    return parseUser(res);
+  } catch (err) {
+    if (err instanceof Error && err.name === "UserNotFoundException") return null;
+    throw err;
+  }
+}
+
+/**
+ * The placeholder number auth-backend parks on an account that must give up
+ * its real mobile — a literal port of `generateRandomPhoneNumber` in
+ * `auth-backend/src/utils/aws.ts`, deliberately keeping the same `1` + 9-digit
+ * shape so ops recognise a released account on sight.
+ */
+export function generateRandomPhoneNumber(): string {
+  const length = 9;
+  const numericPart = Math.floor(Math.random() * Math.pow(10, length))
+    .toString()
+    .padStart(length, "0");
+  return `1${numericPart}`;
+}
+
+/** `AdminDisableUser` — mirrors auth-backend's `disableCognitoUser`. */
+export async function disableUser(
+  environment: Environment,
+  username: string,
+): Promise<void> {
+  const cfg = resolveConfig(environment);
+  const client = getClient(cfg);
+  await client.send(
+    new AdminDisableUserCommand({
+      UserPoolId: cfg.userPoolId,
+      Username: username,
+    }),
+  );
+}
+
+export type PhoneReleaseOutcome = {
+  /** The placeholder parked on the account. */
+  placeholder: string;
+  /** Whether `AdminDisableUser` succeeded. */
+  disabled: boolean;
+  /**
+   * Whether the number is actually free afterwards, re-probed with
+   * `lookupByReservedMobile`. FALSE means the release did not take and the
+   * number is still reserved — never report success on this.
+   */
+  released: boolean;
+  /** The account still holding the number when `released` is false. */
+  stillHeldBy: CognitoUserInfo | null;
+};
+
+/**
+ * Release the mobile a Cognito account currently holds, the same way
+ * auth-backend does it (`employeeEvents.ts` deactivate / replace-add branches):
+ * park a random placeholder on `phone_number`, then disable the account.
+ *
+ * Two deliberate differences from auth-backend's version, which is what let a
+ * silently half-applied release go unnoticed in production:
+ *   1. every call is awaited (auth-backend's `updateCognitoUserPhoneNumber`
+ *      fires `.then()` and returns `true` regardless of the outcome);
+ *   2. it re-probes the number afterwards and REPORTS whether it actually
+ *      became free, instead of assuming it did.
+ */
+export async function releaseUserPhone(
+  environment: Environment,
+  username: string,
+  mobile10: string,
+): Promise<PhoneReleaseOutcome> {
+  const placeholder = generateRandomPhoneNumber();
+  await updateUserPhone(environment, username, placeholder);
+
+  let disabled = false;
+  try {
+    await disableUser(environment, username);
+    disabled = true;
+  } catch (err) {
+    // The number moving off the account is what frees it; a failed disable is
+    // reported, not fatal.
+    console.error("releaseUserPhone: disable failed", describeCognitoError(err));
+  }
+
+  const stillHeldBy = await lookupByReservedMobile(environment, mobile10);
+  return {
+    placeholder,
+    disabled,
+    released: stillHeldBy === null,
+    stillHeldBy,
+  };
+}
+
+/**
  * The app's only Cognito write path: `AdminUpdateUserAttributes` with an
  * explicit attribute map. Called exclusively by the Data Correction card's
  * confirmed actions (phone fix / attribute sync) — never by any read flow.
@@ -155,8 +289,14 @@ export async function updateUserAttributes(
 
 /**
  * Set a Cognito user's phone_number to `+91<mobile10>` and mark it verified —
- * the exact attribute set auth-backend's `updateCognitoUserPhoneNumber` writes
+ * the attribute set auth-backend's `updateCognitoUserPhoneNumber` writes
  * (unverified phones can't be used for SMS sign-in).
+ *
+ * NOTE the value is lowercase `"true"`, which is what Cognito's boolean
+ * attribute parser expects. auth-backend and the previous version of this
+ * function both wrote `"True"`; a value Cognito does not parse leaves the phone
+ * effectively unverified, which is the leading suspect for the releases that
+ * left their old number reserved. Do not "tidy" this back to `"True"`.
  */
 export function updateUserPhone(
   environment: Environment,
@@ -165,15 +305,19 @@ export function updateUserPhone(
 ): Promise<void> {
   return updateUserAttributes(environment, username, {
     phone_number: `+91${mobile10}`,
-    phone_number_verified: "True",
+    phone_number_verified: "true",
   });
 }
 
-/** Human-readable, single-line description of a Cognito failure. */
-export function describeCognitoError(err: unknown): string {
+/**
+ * Human-readable, single-line description of a Cognito failure. `op` names the
+ * failing call; it defaults to `ListUsers` so existing read-path messages are
+ * unchanged.
+ */
+export function describeCognitoError(err: unknown, op = "ListUsers"): string {
   const name = err instanceof Error ? err.name : "Error";
   const msg = err instanceof Error ? err.message : String(err);
-  const parts = [`Cognito ListUsers failed (${name}): ${msg}`];
+  const parts = [`Cognito ${op} failed (${name}): ${msg}`];
   if (err instanceof CognitoIdentityProviderServiceException) {
     const meta = err.$metadata;
     if (meta?.httpStatusCode != null) parts.push(`httpStatus=${meta.httpStatusCode}`);

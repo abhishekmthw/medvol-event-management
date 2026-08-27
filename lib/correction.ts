@@ -2,7 +2,11 @@ import { authSchema, getAuthPool, getPool } from "./db";
 import {
   describeCognitoError,
   lookupByMobile,
+  generateRandomPhoneNumber,
+  lookupByReservedMobile,
   lookupBySub,
+  releaseUserPhone,
+  updateUserAttributes,
   updateUserPhone,
 } from "./cognito";
 import { CognitoIdentityProviderServiceException } from "@aws-sdk/client-cognito-identity-provider";
@@ -29,6 +33,13 @@ import type {
   CorrectionEmployee,
   CorrectionEventSummary,
   CorrectionField,
+  CorrectionMobileAccount,
+  CorrectionMobileChangeResult,
+  CorrectionMobileStep,
+  CorrectionMobileVerification,
+  CorrectionReleaseAttempt,
+  CorrectionReleaseNumberResult,
+  CorrectionReleaseOwner,
   CorrectionRepairParticipant,
   CorrectionRepairResult,
   CorrectionRepairStep,
@@ -1822,6 +1833,11 @@ export async function repairCognitoLinks(
  *     the planned update where there is one, otherwise the account's current
  *     value. Two accounts landing on the same number blocks the whole repair
  *     rather than silently skipping one update and leaving a half-fixed pair.
+ *  3. A number the repair writes is not RESERVED as some other account's
+ *     sign-in identifier. Checks 1 and 2 read attributes only, so they are
+ *     blind to the reservation index (`UsernameAttributes: ['phone_number']`)
+ *     — the exact blind spot that let a number look free while every signup
+ *     for it failed as already-existing. Probed with `AdminGetUser`.
  */
 async function checkRepairIntegrity(
   environment: Environment,
@@ -1926,5 +1942,638 @@ async function checkRepairIntegrity(
     );
   }
 
+  /* ------- Cognito sign-in reservation (invisible to the checks above) ------- */
+
+  // Every number this repair writes may already be reserved as the sign-in
+  // identifier of an account no attribute search can find. Reassigning the
+  // attribute onto our participant does not take that reservation away, so the
+  // other account keeps the number and any signup for it keeps failing — flag
+  // it here instead of leaving the operator with an inexplicable half-fix.
+  const knownSubs = new Set(knownAccounts.map((u) => norm(u.sub)).filter(Boolean));
+  for (const [sub, phone] of desired) {
+    knownSubs.add(sub);
+    try {
+      const reserved = await lookupByReservedMobile(environment, phone);
+      if (!reserved || knownSubs.has(norm(reserved.sub))) continue;
+      blockers.push(
+        `Cognito mobile ${displayMobile10(phone)} is reserved as the sign-in number of another account — ${norm(reserved.sub) || reserved.username} (short code ${norm(reserved.emp_short_code) || "—"}, phone attribute ${displayMobile10(reserved.phone_number) || "—"}${reserved.enabled === false ? ", disabled" : ""}) — which no attribute search can see. Writing it onto ${labelForSub.get(sub) ?? sub} would not take the reservation away. Use “Change Cognito mobile / release reserved number” on that account first.`,
+      );
+    } catch (e) {
+      // A probe failure must not silently pass the gate.
+      blockers.push(
+        `Could not verify whether ${displayMobile10(phone)} is reserved by another Cognito account: ${describeCognitoError(e, "AdminGetUser")}`,
+      );
+    }
+  }
+
   return blockers;
+}
+
+/* ------------- action 4: change Cognito mobile / release number ------------- */
+
+/**
+ * Why this action exists.
+ *
+ * The pool is configured `UsernameAttributes: ['phone_number']`, so the number
+ * supplied at SIGN-UP becomes the account's sign-in identifier and lives in an
+ * internal index that is not the `phone_number` attribute. Every other tool
+ * here — and the Cognito console, and the signup Lambdas — reads attributes
+ * only, so an account can hold a number as its sign-in identifier while being
+ * invisible to every search for it. When that happens, signup for that number
+ * fails with `UsernameExistsException` and nothing on screen explains why.
+ *
+ * This action is the one place that reads BOTH views (`lookupByReservedMobile`
+ * for the reservation, `lookupByMobile`/`lookupBySub` for the attribute), shows
+ * the operator where they disagree, repoints an account's mobile, and — when
+ * another account is squatting on the wanted number — releases it the same way
+ * auth-backend does (randomize the phone, then disable).
+ *
+ * Scope is deliberately Cognito-only: corp/auth `mobile_no` are owned by the
+ * event pipeline, and a second writer is what produced this drift in the first
+ * place. The DB mobiles are shown for context, never written.
+ *
+ * Nothing is assumed to have worked: every write is followed by a re-probe and
+ * each outcome is reported, because auth-backend's version of this sequence
+ * cannot fail visibly and that is why the production case went unnoticed.
+ */
+function toMobileAccount(u: CognitoUserInfo): CorrectionMobileAccount {
+  return {
+    sub: u.sub,
+    username: u.username,
+    shortCode: u.emp_short_code,
+    name: u.name,
+    status: u.status,
+    enabled: u.enabled,
+    attributeMobile10: normalizeMobile(u.phone_number),
+  };
+}
+
+function describeAccount(a: CorrectionMobileAccount): string {
+  const bits = [
+    a.shortCode ? `short code ${a.shortCode}` : null,
+    a.status,
+    a.enabled === false ? "disabled" : null,
+    a.attributeMobile10 ? `phone attribute ${displayMobile10(a.attributeMobile10)}` : null,
+  ].filter(Boolean);
+  return `${a.sub ?? a.username ?? "unknown account"}${bits.length ? ` (${bits.join(", ")})` : ""}`;
+}
+
+export async function changeMobileAndRelease(
+  environment: Environment,
+  empmasterId: string,
+  newMobileInput: string,
+  releaseConflicting: boolean,
+  preview: boolean,
+): Promise<CorrectionMobileChangeResult> {
+  const newMobile10 = normalizeMobile(newMobileInput) ?? "";
+
+  const base: CorrectionMobileChangeResult = {
+    ok: false,
+    message: "",
+    newMobile10,
+    target: null,
+    targetVia: null,
+    oldMobile10: null,
+    newNumberHolder: null,
+    oldNumberHolder: null,
+    dbMobile10: { corp: null, auth: null },
+    steps: [],
+    verifications: [],
+    blockers: [],
+    warnings: [],
+    applied: 0,
+    updated: false,
+    preview,
+  };
+  const fail = (
+    message: string,
+    extra: Partial<CorrectionMobileChangeResult> = {},
+  ): CorrectionMobileChangeResult => ({ ...base, ...extra, ok: false, message });
+
+  if (!/^\d{10}$/.test(newMobile10)) {
+    return fail("Enter a valid 10-digit mobile number.");
+  }
+
+  const corp = await fetchCorpById(environment, empmasterId);
+  if (!corp) return fail(`No corp employee with empmaster_id ${empmasterId}.`);
+  const corpShortCode = norm(corp.emp_shortcode);
+  const corpMobile = normalizeMobile(corp.mobile_no);
+
+  const authMatches = (
+    await fetchAuthByShortCodes(environment, [corpShortCode].filter(Boolean))
+  ).filter(
+    (a) =>
+      pairKey(a.short_code, a.company_code) ===
+      pairKey(corp.emp_shortcode, corp.company_code),
+  );
+  const auth = authMatches.length === 1 ? authMatches[0] : null;
+  const dbMobile10 = {
+    corp: corpMobile,
+    auth: auth ? normalizeMobile(auth.mobile_no) : null,
+  };
+
+  const warnings: string[] = [];
+  const blockers: string[] = [];
+  if (authMatches.length > 1) {
+    warnings.push(
+      `${authMatches.length} auth records match (short code, company code) — the auth mobile shown may not be the right row.`,
+    );
+  }
+
+  /* ---------------- resolve the account to repoint ---------------- */
+  let target: CognitoUserInfo | null = null;
+  let targetVia: CorrectionMobileChangeResult["targetVia"] = null;
+  try {
+    const storedSub = norm(corp.cognito_id) || norm(auth?.cognito_id);
+    if (storedSub) {
+      target = (await lookupBySub(environment, storedSub))[0] ?? null;
+      if (target) targetVia = "sub";
+      else
+        warnings.push(
+          `Stored cognito_id ${storedSub} matches no Cognito account — resolving by mobile instead.`,
+        );
+    }
+    if (!target && corpMobile) {
+      const res = resolveCognitoTarget(
+        await lookupByMobile(environment, corpMobile),
+        corpShortCode,
+      );
+      if (res.target) {
+        target = res.target;
+        targetVia = "mobile";
+      }
+    }
+    // Last resort, and the case that matters: the account is findable ONLY
+    // through the reservation index because its phone attribute was rewritten.
+    // Try the corp mobile, then the wanted number — an account already
+    // reserving the wanted number whose short code matches corp IS this
+    // employee's account, and repointing it is a realignment, not a claim.
+    if (!target) {
+      for (const probe of [corpMobile, newMobile10].filter(Boolean) as string[]) {
+        const held = await lookupByReservedMobile(environment, probe);
+        if (held && (sameCode(held.emp_short_code, corpShortCode) || probe === corpMobile)) {
+          target = held;
+          targetVia = "reserved";
+          break;
+        }
+      }
+    }
+  } catch (e) {
+    return fail(describeCognitoError(e, "lookup"), { dbMobile10, warnings });
+  }
+
+  if (!target) {
+    return fail(
+      "No Cognito account could be resolved for this employee — by stored cognito_id, by corp mobile, or by reservation. Nothing to repoint.",
+      { dbMobile10, warnings },
+    );
+  }
+
+  const targetAccount = toMobileAccount(target);
+  const oldMobile10 = targetAccount.attributeMobile10;
+  if (targetVia === "reserved") {
+    warnings.push(
+      "This account was found only through Cognito's sign-in reservation index — no attribute search can see it, which is why signup for its number fails.",
+    );
+  }
+  if (!sameCode(target.emp_short_code, corpShortCode)) {
+    warnings.push(
+      `Cognito short code (${norm(target.emp_short_code) || "—"}) ≠ corp short code (${corpShortCode || "—"}) — the account's custom:* attributes are stale and will carry the previous position's claims into RBAC until they are re-synced.`,
+    );
+  }
+
+  /* ---------------- who holds the numbers involved ---------------- */
+  let newNumberHolder: CognitoUserInfo | null = null;
+  let oldNumberHolder: CognitoUserInfo | null = null;
+  try {
+    newNumberHolder = await lookupByReservedMobile(environment, newMobile10);
+    oldNumberHolder =
+      oldMobile10 && oldMobile10 !== newMobile10
+        ? await lookupByReservedMobile(environment, oldMobile10)
+        : null;
+  } catch (e) {
+    return fail(describeCognitoError(e, "AdminGetUser"), {
+      target: targetAccount,
+      targetVia,
+      oldMobile10,
+      dbMobile10,
+      warnings,
+    });
+  }
+
+  const sameAccount = (u: CognitoUserInfo | null): boolean =>
+    !!u && !!target && norm(u.sub) === norm(target.sub);
+
+  const steps: CorrectionMobileStep[] = [];
+
+  if (newNumberHolder && !sameAccount(newNumberHolder)) {
+    const holder = toMobileAccount(newNumberHolder);
+    if (!releaseConflicting) {
+      blockers.push(
+        `${displayMobile10(newMobile10)} is reserved as the sign-in number of another account — ${describeAccount(holder)}. Tick “release the other account” to park a placeholder number on it and disable it, or repoint that employee first.`,
+      );
+    } else if (!newNumberHolder.username) {
+      blockers.push(
+        `${displayMobile10(newMobile10)} is reserved by ${describeAccount(holder)}, but that account has no username to write to — release it manually.`,
+      );
+    } else {
+      steps.push({
+        kind: "cognitoRelease",
+        sub: holder.sub,
+        username: newNumberHolder.username,
+        shortCode: holder.shortCode,
+        mobile10: newMobile10,
+      });
+    }
+  }
+
+  if (!target.username) {
+    blockers.push("The target Cognito account has no username — cannot write to it.");
+  } else if (oldMobile10 === newMobile10) {
+    warnings.push(
+      `The account's phone attribute is already ${displayMobile10(newMobile10)} — no attribute write needed.`,
+    );
+  } else {
+    steps.push({
+      kind: "cognitoPhone",
+      sub: targetAccount.sub,
+      username: target.username,
+      shortCode: targetAccount.shortCode,
+      before: oldMobile10,
+      after: newMobile10,
+    });
+  }
+
+  // The reservation cannot be moved by an attribute write, so state plainly
+  // what will and will not be true afterwards rather than implying a full move.
+  if (sameAccount(newNumberHolder)) {
+    warnings.push(
+      `${displayMobile10(newMobile10)} is already this account's sign-in number — this realigns the phone attribute to it.`,
+    );
+  } else if (!newNumberHolder) {
+    warnings.push(
+      `${displayMobile10(newMobile10)} is not reserved as any account's sign-in number, so it can only be used for attribute-based flows (OTP/SMS), not for sign-in by number on this account. Sign-in numbers are fixed at signup.`,
+    );
+  }
+  if (oldNumberHolder && sameAccount(oldNumberHolder)) {
+    warnings.push(
+      `${displayMobile10(oldMobile10!)} stays reserved as this account's sign-in number even after the attribute moves — a fresh signup for it will keep failing with UsernameExistsException.`,
+    );
+  }
+
+  const summary = steps
+    .map((s) =>
+      s.kind === "cognitoRelease"
+        ? `release ${displayMobile10(s.mobile10)} from ${s.shortCode || s.sub || "the other account"}`
+        : `set the phone attribute to ${displayMobile10(s.after)}`,
+    )
+    .join(", ");
+
+  const withState = (
+    extra: Partial<CorrectionMobileChangeResult>,
+  ): CorrectionMobileChangeResult => ({
+    ...base,
+    target: targetAccount,
+    targetVia,
+    oldMobile10,
+    newNumberHolder: newNumberHolder ? toMobileAccount(newNumberHolder) : null,
+    oldNumberHolder: oldNumberHolder ? toMobileAccount(oldNumberHolder) : null,
+    dbMobile10,
+    steps,
+    blockers,
+    warnings,
+    ...extra,
+  });
+
+  if (preview) {
+    return withState({
+      ok: true,
+      preview: true,
+      message:
+        blockers.length > 0
+          ? `Blocked — ${blockers.length} problem${blockers.length === 1 ? "" : "s"} must be resolved first.`
+          : steps.length === 0
+            ? "Nothing to change — the account already carries this number."
+            : `Would ${summary}.`,
+    });
+  }
+
+  if (blockers.length > 0) {
+    return withState({ ok: false, message: `Blocked: ${blockers.join(" ")}` });
+  }
+  if (steps.length === 0) {
+    return withState({
+      ok: true,
+      message: "Nothing to change — the account already carries this number.",
+    });
+  }
+
+  /* ---------------- apply, each write awaited then verified ---------------- */
+  const verifications: CorrectionMobileVerification[] = [];
+  let applied = 0;
+  try {
+    for (const step of steps) {
+      if (step.kind === "cognitoRelease") {
+        const outcome = await releaseUserPhone(environment, step.username, step.mobile10);
+        applied += 1;
+        verifications.push({
+          label: `${displayMobile10(step.mobile10)} released by ${step.shortCode || step.sub || step.username}`,
+          ok: outcome.released,
+          detail: outcome.released
+            ? `Parked placeholder +91${outcome.placeholder}${outcome.disabled ? " and disabled the account" : " (disable FAILED — see server logs)"}; the number is no longer reserved.`
+            : `Parked placeholder +91${outcome.placeholder}${outcome.disabled ? " and disabled the account" : " (disable also FAILED)"}, but the number is STILL reserved by ${outcome.stillHeldBy ? describeAccount(toMobileAccount(outcome.stillHeldBy)) : "an account"}. Signup for it will keep failing.`,
+        });
+        if (!outcome.released) {
+          // Never claim a number was freed when the re-probe says otherwise,
+          // and never go on to write it onto another account.
+          console.error(
+            "[mobile-change] release not verified",
+            environment,
+            step.mobile10,
+            outcome,
+          );
+          return withState({
+            ok: false,
+            applied,
+            updated: true,
+            verifications,
+            message: `${displayMobile10(step.mobile10)} could not be released — it is still reserved. Stopped before repointing the employee; nothing else was written.`,
+          });
+        }
+      } else {
+        await updateUserPhone(environment, step.username, step.after);
+        applied += 1;
+        const holderNow = await lookupByReservedMobile(environment, step.after);
+        verifications.push({
+          label: `Phone attribute set to ${displayMobile10(step.after)}`,
+          ok: true,
+          detail: "Written and marked verified.",
+        });
+        verifications.push({
+          label: `${displayMobile10(step.after)} usable as this account's sign-in number`,
+          ok: sameAccount(holderNow),
+          detail: sameAccount(holderNow)
+            ? "The reservation already points at this account, so sign-in by this number works."
+            : holderNow
+              ? `Reserved by a different account — ${describeAccount(toMobileAccount(holderNow))}.`
+              : "Not reserved by any account. OTP/SMS flows that read the attribute work; sign-in by this number does not, because sign-in numbers are fixed at signup.",
+        });
+        if (step.before) {
+          const oldNow = await lookupByReservedMobile(environment, step.before);
+          verifications.push({
+            label: `${displayMobile10(step.before)} free for a new signup`,
+            ok: oldNow === null,
+            detail:
+              oldNow === null
+                ? "No longer reserved — a new account can use it."
+                : `Still reserved by ${describeAccount(toMobileAccount(oldNow))}. A signup for it will fail with UsernameExistsException.`,
+          });
+        }
+      }
+    }
+  } catch (e) {
+    return withState({
+      ok: false,
+      applied,
+      updated: applied > 0,
+      verifications,
+      message: `${describeCognitoError(e, "AdminUpdateUserAttributes")} — ${applied} of ${steps.length} step(s) had been applied.`,
+    });
+  }
+
+  // No audit table exists in this app; the log line is the only trail.
+  console.log("[mobile-change]", environment, empmasterId, newMobile10, verifications);
+
+  const failed = verifications.filter((v) => !v.ok);
+  return withState({
+    ok: true,
+    applied,
+    updated: true,
+    verifications,
+    message:
+      failed.length === 0
+        ? `Applied: ${summary}. All checks passed.`
+        : `Applied: ${summary}. ${failed.length} check${failed.length === 1 ? "" : "s"} did not pass — read them before telling the user it is fixed.`,
+  });
+}
+
+/* ---------------- action 5: release a reserved mobile number ---------------- */
+
+/**
+ * Free a mobile number that is stuck as some other account's sign-in
+ * identifier, keyed on the NUMBER alone.
+ *
+ * This is the counterpart to `changeMobileAndRelease`, and the one that fits
+ * the actual production symptom. There, an operator knows which employee needs
+ * a number; here they only know that a number cannot be signed up: it appears
+ * nowhere in Cognito (no account carries it as a `phone_number` attribute, no
+ * search finds it, the console shows nothing) yet `SignUp` rejects it as
+ * already existing. That happens because the number is still the sign-in
+ * identifier of a DIFFERENT account whose phone attribute was rewritten —
+ * typically auth-backend's randomize-then-disable release on a deactivation or
+ * replace-add, half-applied so that the attribute moved but the sign-in index
+ * did not.
+ *
+ * Releasing it here — rather than reusing the stale account — is the better
+ * outcome: once the number is free, the ordinary signup chain runs in full
+ * (Pre Sign-up → CustomMessage_SignUp → Post Confirmation), so the new
+ * employee gets a fresh account with correct `custom:*` and a `cognito_id`
+ * link, instead of inheriting the predecessor's identity attributes.
+ *
+ * Two attempts, in order, because which one is needed depends on why the index
+ * is stale:
+ *   1. **re-assert** — write the holder's phone attribute back to the value it
+ *      already carries. A write Cognito processes fully re-syncs the sign-in
+ *      index, which is all that is needed when a previous write half-applied.
+ *   2. **placeholder** — if the number is still reserved, write a fresh
+ *      `1`+9-digit placeholder (auth-backend's shape), i.e. move the attribute
+ *      to a value the account has never held.
+ * Each attempt is verified with `lookupByReservedMobile` before the next is
+ * tried, and the tool never claims a release it did not observe.
+ *
+ * It deliberately does NOT disable the holder, touch its `custom:*`, or write
+ * any DB column: the only thing standing between the operator and a working
+ * signup is the number.
+ */
+export async function releaseReservedNumber(
+  environment: Environment,
+  mobileInput: string,
+  preview: boolean,
+): Promise<CorrectionReleaseNumberResult> {
+  const mobile10 = normalizeMobile(mobileInput) ?? "";
+  const base: CorrectionReleaseNumberResult = {
+    ok: false,
+    message: "",
+    mobile10,
+    holder: null,
+    owners: [],
+    attributeMatches: false,
+    attempts: [],
+    released: false,
+    blockers: [],
+    warnings: [],
+    preview,
+  };
+
+  if (!/^\d{10}$/.test(mobile10)) {
+    return { ...base, message: "Enter a valid 10-digit mobile number." };
+  }
+
+  let held: CognitoUserInfo | null;
+  try {
+    held = await lookupByReservedMobile(environment, mobile10);
+  } catch (e) {
+    return { ...base, message: describeCognitoError(e, "AdminGetUser") };
+  }
+
+  if (!held) {
+    // Worth stating plainly: the number is available, so whatever failed was
+    // not a reservation collision and releasing nothing would not fix it.
+    return {
+      ...base,
+      ok: true,
+      released: true,
+      message: `${displayMobile10(mobile10)} is not reserved by any Cognito account — it is free for a signup. If a signup for it still fails, the cause is elsewhere (check the Pre Sign-up gate and the auth record).`,
+    };
+  }
+
+  const holder = toMobileAccount(held);
+  const attributeMatches = holder.attributeMobile10 === mobile10;
+  const blockers: string[] = [];
+  const warnings: string[] = [];
+
+  // Who does this account belong to? Releasing a number from an account that a
+  // live employee still uses would break their login, so show every row that
+  // stores the sub and refuse when the account looks genuinely in use.
+  let owners: CorrectionReleaseOwner[] = [];
+  if (holder.sub) {
+    try {
+      owners = (await findCognitoHolders(environment, [holder.sub])).map((h) => ({
+        db: h.db,
+        table: h.table,
+        id: h.id,
+        name: h.name,
+        shortCode: h.shortCode,
+      }));
+    } catch (e) {
+      warnings.push(
+        `Could not check which records store this account's cognito_id: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
+  if (attributeMatches) {
+    blockers.push(
+      `${displayMobile10(mobile10)} is genuinely in use: ${describeAccount(holder)} both reserves it AND carries it as its phone attribute. This is a working account, not a stale reservation — releasing it would break that user's login. If the number must move to someone else, run “Change Cognito mobile” on THAT employee first.`,
+    );
+  }
+  if (owners.length > 0) {
+    warnings.push(
+      `This account is still linked from ${owners
+        .map((o) => `${o.db} ${o.table} row ${o.id}${o.shortCode ? ` (${o.shortCode})` : ""}`)
+        .join(", ")} — releasing the number does not unlink it, and those records keep working. Verify none of them is a currently active user of this number.`,
+    );
+  }
+  if (holder.enabled !== false) {
+    warnings.push(
+      "The holder account is still ENABLED, although a completed release always disables it — further evidence the earlier release half-applied.",
+    );
+  }
+
+  const state = (
+    extra: Partial<CorrectionReleaseNumberResult>,
+  ): CorrectionReleaseNumberResult => ({
+    ...base,
+    holder,
+    owners,
+    attributeMatches,
+    blockers,
+    warnings,
+    ...extra,
+  });
+
+  if (preview) {
+    return state({
+      ok: true,
+      preview: true,
+      message:
+        blockers.length > 0
+          ? "Blocked — see below."
+          : `${displayMobile10(mobile10)} is reserved by ${describeAccount(holder)}, whose phone attribute is ${holder.attributeMobile10 ? displayMobile10(holder.attributeMobile10) : "not set"} — which is why no search finds the number. Releasing it re-writes that account's phone attribute (first to the value it already holds, then to a fresh placeholder if needed) until the number is verified free.`,
+    });
+  }
+
+  if (blockers.length > 0) {
+    return state({ message: `Blocked: ${blockers.join(" ")}` });
+  }
+  if (!held.username) {
+    return state({
+      message: "The holder account has no username to write to — release it manually.",
+    });
+  }
+  const username = held.username;
+
+  const attempts: CorrectionReleaseAttempt[] = [];
+  const currentAttr = held.phone_number;
+  try {
+    // Attempt 1 — re-assert the existing attribute value verbatim (never
+    // reconstructed from the 10-digit form, so a differently-formatted value is
+    // preserved exactly).
+    if (currentAttr) {
+      await updateUserAttributes(environment, username, {
+        phone_number: currentAttr,
+        phone_number_verified: "true",
+      });
+      const stillHeld = await lookupByReservedMobile(environment, mobile10);
+      attempts.push({
+        kind: "reassert",
+        wrote: currentAttr,
+        released: stillHeld === null,
+        detail:
+          stillHeld === null
+            ? "Re-writing the account's existing phone attribute re-synced the sign-in index and freed the number."
+            : `Still reserved by ${describeAccount(toMobileAccount(stillHeld))} — trying a fresh placeholder next.`,
+      });
+    }
+
+    // Attempt 2 — move the attribute to a value the account has never held.
+    if (!attempts.some((a) => a.released)) {
+      const placeholder = `+91${generateRandomPhoneNumber()}`;
+      await updateUserAttributes(environment, username, {
+        phone_number: placeholder,
+        phone_number_verified: "true",
+      });
+      const stillHeld = await lookupByReservedMobile(environment, mobile10);
+      attempts.push({
+        kind: "placeholder",
+        wrote: placeholder,
+        released: stillHeld === null,
+        detail:
+          stillHeld === null
+            ? "Moving the phone attribute to a fresh placeholder freed the number."
+            : `Still reserved by ${describeAccount(toMobileAccount(stillHeld))}. The sign-in identifier is not moving — in this pool it may be permanent, in which case the number can only be reused by reusing that account (mobile-verification's ensureCognitoAccount does exactly that on the next login).`,
+      });
+    }
+  } catch (e) {
+    return state({
+      attempts,
+      message: `${describeCognitoError(e, "AdminUpdateUserAttributes")} — ${attempts.length} attempt(s) had been made.`,
+    });
+  }
+
+  const released = attempts.some((a) => a.released);
+  console.log("[release-number]", environment, mobile10, {
+    holder: holder.sub,
+    attempts,
+    released,
+  });
+
+  return state({
+    ok: released,
+    released,
+    attempts,
+    message: released
+      ? `${displayMobile10(mobile10)} is now free — verified with AdminGetUser. A signup for it will go through the normal chain (Pre Sign-up → CustomMessage_SignUp → Post Confirmation), so the new account gets its own custom:* attributes and cognito_id.`
+      : `${displayMobile10(mobile10)} is STILL reserved by ${describeAccount(holder)} after ${attempts.length} attempt(s). Nothing else was changed — do not retry blindly; read the attempt details.`,
+  });
 }

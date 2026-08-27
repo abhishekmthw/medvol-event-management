@@ -590,6 +590,124 @@ export type CorrectionRepairResult = {
   preview: boolean;
 };
 
+/**
+ * How a Cognito account relates to a mobile number. `attribute` is what
+ * `ListUsers`/the console can see; `reserved` is the sign-in identifier held in
+ * the pool's internal index (`UsernameAttributes: ['phone_number']`). The two
+ * drift apart whenever a phone attribute is rewritten, and only the reserved
+ * one decides whether a new signup for that number is possible.
+ */
+export type CorrectionMobileAccount = {
+  sub: string | null;
+  username: string | null;
+  shortCode: string | null;
+  name: string | null;
+  status: string | null;
+  enabled: boolean | null;
+  /** `phone_number` attribute, 10-digit. */
+  attributeMobile10: string | null;
+};
+
+/** One write the mobile change performs, in apply order. */
+export type CorrectionMobileStep =
+  | {
+      /** Repoint an account's `phone_number` to the new number. */
+      kind: "cognitoPhone";
+      sub: string | null;
+      username: string;
+      shortCode: string | null;
+      before: string | null;
+      after: string;
+    }
+  | {
+      /**
+       * Park a random placeholder on an account and disable it, freeing the
+       * number it holds — auth-backend's randomize-then-disable release.
+       */
+      kind: "cognitoRelease";
+      sub: string | null;
+      username: string;
+      shortCode: string | null;
+      /** The number being freed. */
+      mobile10: string;
+    };
+
+/** A post-write probe. `ok: false` means the write did not achieve its intent. */
+export type CorrectionMobileVerification = {
+  label: string;
+  ok: boolean;
+  detail: string;
+};
+
+export type CorrectionMobileChangeResult = {
+  ok: boolean;
+  message: string;
+  newMobile10: string;
+  /** The account being repointed (null when it could not be resolved). */
+  target: CorrectionMobileAccount | null;
+  /** How the target was resolved — `reserved` means it was found ONLY via the
+   * internal sign-in index, i.e. invisible to every attribute search. */
+  targetVia: "sub" | "mobile" | "reserved" | null;
+  /** The number the target holds today, 10-digit. */
+  oldMobile10: string | null;
+  /** Account reserving the NEW number, if any (blocks unless it is the target). */
+  newNumberHolder: CorrectionMobileAccount | null;
+  /** Account reserving the OLD number, if any. */
+  oldNumberHolder: CorrectionMobileAccount | null;
+  /** DB values shown for context — this action never writes them. */
+  dbMobile10: { corp: string | null; auth: string | null };
+  steps: CorrectionMobileStep[];
+  /** Post-apply probes (empty in preview). */
+  verifications: CorrectionMobileVerification[];
+  blockers: string[];
+  warnings: string[];
+  applied: number;
+  updated: boolean;
+  preview: boolean;
+};
+
+/** A DB row that stores the reserved account's sub, shown for safety. */
+export type CorrectionReleaseOwner = {
+  db: "auth" | "corp";
+  table: string;
+  id: string;
+  name: string | null;
+  shortCode: string | null;
+};
+
+/** One attempt at freeing a reserved number, in the order they are tried. */
+export type CorrectionReleaseAttempt = {
+  /**
+   * `reassert` rewrites the holder's phone attribute to the value it ALREADY
+   * carries — enough to make Cognito reprocess a sign-in index left stale by a
+   * half-applied write. `placeholder` writes a fresh `1`+9-digit number, the
+   * shape auth-backend parks on a released account.
+   */
+  kind: "reassert" | "placeholder";
+  wrote: string;
+  /** Whether the number was free after this attempt. */
+  released: boolean;
+  detail: string;
+};
+
+export type CorrectionReleaseNumberResult = {
+  ok: boolean;
+  message: string;
+  mobile10: string;
+  /** The account reserving the number — null when it is genuinely free. */
+  holder: CorrectionMobileAccount | null;
+  /** Rows storing the holder's sub (corp empmaster_hdr + the 5 auth tables). */
+  owners: CorrectionReleaseOwner[];
+  /** Whether the holder also carries the number as its phone attribute. */
+  attributeMatches: boolean;
+  attempts: CorrectionReleaseAttempt[];
+  /** Verified state at the end: is the number free for a fresh signup? */
+  released: boolean;
+  blockers: string[];
+  warnings: string[];
+  preview: boolean;
+};
+
 /** One auth column the corp-sync would change (before → after). */
 export type CorrectionSyncChange = {
   column: string;
