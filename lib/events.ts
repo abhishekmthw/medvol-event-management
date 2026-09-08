@@ -1,5 +1,6 @@
 import {
   buildConsumerRequest,
+  buildCurl,
   callConsumerApi,
   describeConsumerRoute,
   resolveConsumerApi,
@@ -712,6 +713,7 @@ function resolveExecuteRow(
       method: raw.method,
       url,
       consumer_status: consumerStatus,
+      curl: null,
       eligible,
       warnings: [...problems, ...warnings],
       http_status: null,
@@ -844,9 +846,16 @@ export async function executeExpiredEvents(
         row.response = truncateResponse(out.raw);
 
         if (!out.ok) {
+          // Handed to the operator with credentials intact so the exact
+          // request can be replayed in Postman; the server log keeps them
+          // redacted.
+          row.curl = out.curl;
+          console.error(
+            `[execute-expired-events] ${row.event_id} failed: HTTP ${out.status ?? "network"} ${out.raw}\n${buildCurl(req, { redact: true })}`,
+          );
           errors.push({
             id: row.event_id,
-            reason: `HTTP ${out.status ?? "—"}: ${truncateResponse(out.raw) || "<empty>"}\nRequest:\n${out.curl}`,
+            reason: `HTTP ${out.status ?? "—"}: ${truncateResponse(out.raw) || "<empty>"} — full curl on the row below.`,
           });
           return;
         }

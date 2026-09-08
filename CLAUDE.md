@@ -142,6 +142,7 @@ Fully **dynamic** — driven by `events.domain` / `action` / `method` / `data` /
 | `x-my-key` | `JSON.stringify(userDetails)` when `userDetails.sub` exists, else the consumers' **hardcoded `adminUser`** object (copied verbatim into `ADMIN_USER`) | corp:83 / oms:88 |
 | `eventid` / `eventtype` / `streamid` / `consumername` | event id, `event_type`, `"eventStreamStreamId"`, `"V2"` | both consumers |
 | `machine-token` | OMS only, **optional here** | oms:87 |
+| `User-Agent` | `medvol-event-management/1.0` — **not** a consumer header. The consumers use axios (which sets its own); `fetch` sends none, and AWS WAF's managed `NoUserAgent_HEADER` rule 403s a request with no UA **before the authorizer runs** (symptom: `{"message":"Forbidden"}` with no authorizer invocation in CloudWatch). | — |
 | `company_code` | **Set from the selected private instance**, not from the event — the OMS gateway is shared, so this header is what routes to the instance. Absent for the shared instance. | oms:90-92 / `md-batch-lambda/lambda/event-api-creation/index.mjs:73` |
 
 **Why `authorization` must stay nested:** `lambda-corp-authorizor/lambda/index.mjs:445` reads `tokenData.userDetails` and substitutes its own `adminUser` when absent, then the gateway maps it onto `x-my-key`. Spreading `...userDetails` flat would still authorize but would silently re-attribute **every write** to `AuthMachine`.

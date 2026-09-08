@@ -38,6 +38,9 @@ const DEFAULT_TIMEOUT_MS = Number(
 /** Consumer name every V2 row is scoped to (mirrors the lambdas' constants). */
 const CONSUMER_NAME = "V2";
 
+/** Identifies this tool in access logs; see the header comment below. */
+const USER_AGENT = "medvol-event-management/1.0";
+
 function readEnv(name: string): string | undefined {
   const v = process.env[name];
   return v && v.trim() ? v.trim() : undefined;
@@ -219,6 +222,13 @@ export function buildConsumerRequest(
 
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
+    // NOT a consumer header — the consumers use axios, which always sets its
+    // own `User-Agent: axios/x.y.z`. `fetch` (undici) sends none, and AWS
+    // WAF's managed `NoUserAgent_HEADER` rule BLOCKS a request with no
+    // User-Agent, returning 403 {"message":"Forbidden"} before the authorizer
+    // is ever invoked. Sent explicitly so an identical replay is not rejected
+    // for a reason that has nothing to do with the event.
+    "User-Agent": USER_AGENT,
     authorization,
     eventid: ev.eventId,
     eventtype: ev.eventType ?? "",
@@ -249,19 +259,30 @@ function shellQuote(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
+const SECRET_HEADERS = ["authorization", "x-my-key", "machine-token"];
+
 /**
- * A reproducible curl for the request, with credentials REDACTED. Unlike
- * `buildCurl` in `lib/playground.ts` (whose header values are safe to print),
- * `authorization` carries the consumer API key and `x-my-key` a full decoded
- * token, so neither may reach a browser or a log line.
+ * A reproducible curl for the request.
+ *
+ * `redact: true` masks `authorization` (the consumer API key) and `x-my-key`
+ * (a full decoded token) — used for the server-side log line.
+ *
+ * `redact: false` (the default) prints them in full, and is what the UI shows
+ * when a call FAILS: without the real credentials the command cannot be
+ * replayed in Postman, which is the only reason to read it. A deliberate
+ * trade-off — `buildCurl` in `lib/playground.ts` has no such choice to make,
+ * its header values are not secrets — so treat a screenshot of a failed run
+ * as a credential.
  */
-export function redactedCurl(req: ConsumerRequest): string {
+export function buildCurl(
+  req: ConsumerRequest,
+  options: { redact?: boolean } = {},
+): string {
+  const redact = options.redact ?? false;
   const lines: string[] = [`curl -X ${req.method} ${shellQuote(req.url)}`];
   for (const [k, v] of Object.entries(req.headers)) {
-    const lower = k.toLowerCase();
-    const redacted =
-      lower === "authorization" || lower === "x-my-key" || lower === "machine-token";
-    lines.push(`  -H ${shellQuote(`${k}: ${redacted ? "<redacted>" : v}`)}`);
+    const hide = redact && SECRET_HEADERS.includes(k.toLowerCase());
+    lines.push(`  -H ${shellQuote(`${k}: ${hide ? "<redacted>" : v}`)}`);
   }
   if (req.body) lines.push(`  --data-raw ${shellQuote(req.body)}`);
   return lines.join(" \\\n");
@@ -273,7 +294,10 @@ export type ConsumerApiOutcome = {
   status: number | null;
   /** Response body text, or the error message when the request failed. */
   raw: string;
-  /** Reproducible curl with credentials redacted. */
+  /**
+   * Reproducible curl, credentials INCLUDED — surfaced to the operator only on
+   * failure, so a rejected call can be replayed in Postman as-is.
+   */
   curl: string;
 };
 
@@ -289,7 +313,7 @@ export async function callConsumerApi(
   req: ConsumerRequest,
   timeoutMs: number = DEFAULT_TIMEOUT_MS,
 ): Promise<ConsumerApiOutcome> {
-  const curl = redactedCurl(req);
+  const curl = buildCurl(req);
   const ctrl = new AbortController();
   const t = setTimeout(() => ctrl.abort(), timeoutMs);
   try {

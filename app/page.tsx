@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   AlertTriangle,
@@ -8,6 +8,7 @@ import {
   ChevronRight,
   CircleAlert,
   CirclePlay,
+  Copy,
   Database,
   Eraser,
   Eye,
@@ -578,6 +579,64 @@ function httpPillClass(status: number): string {
   return "bg-red-500/15 text-red-600 dark:text-red-400";
 }
 
+/**
+ * The failed request as a copy-pasteable curl, credentials INCLUDED (Postman's
+ * Import > Raw text takes it verbatim). Rendered only for a failed row —
+ * without the real `authorization` / `x-my-key` the command cannot be
+ * replayed, which is the only reason to read it. State is per-row so "Copied"
+ * feedback cannot leak across rows.
+ */
+function CurlBlock({ curl }: { curl: string }) {
+  const [state, setState] = useState<"idle" | "copied" | "failed">("idle");
+
+  async function copy() {
+    try {
+      // navigator.clipboard needs a secure context — it is undefined over
+      // plain http:// on a LAN address, so fail loudly instead of no-op.
+      if (!navigator.clipboard) throw new Error("clipboard unavailable");
+      await navigator.clipboard.writeText(curl);
+      setState("copied");
+      setTimeout(() => setState("idle"), 2000);
+    } catch {
+      setState("failed");
+    }
+  }
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-[11px] font-medium uppercase tracking-wide text-[hsl(var(--muted-foreground))]">
+          Request as sent — includes credentials
+        </span>
+        <button
+          type="button"
+          onClick={copy}
+          className="inline-flex items-center gap-1 rounded border border-[hsl(var(--border))] px-2 py-1 text-[11px] hover:bg-[hsl(var(--muted))]"
+        >
+          {state === "copied" ? (
+            <>
+              <CheckCircle2 className="h-3 w-3" /> Copied
+            </>
+          ) : (
+            <>
+              <Copy className="h-3 w-3" /> Copy curl
+            </>
+          )}
+        </button>
+      </div>
+      {state === "failed" && (
+        <p className="text-[11px] text-[hsl(var(--danger))]">
+          Clipboard blocked by the browser (needs https or localhost) — select
+          the text below and copy it manually.
+        </p>
+      )}
+      <pre className="max-h-56 select-all overflow-auto whitespace-pre-wrap break-all rounded border border-[hsl(var(--border))] bg-[hsl(var(--muted))]/40 p-2 font-mono text-[11px] leading-relaxed">
+        {curl}
+      </pre>
+    </div>
+  );
+}
+
 function ExecuteTable({ rows }: { rows: ExecuteEventRow[] }) {
   if (rows.length === 0) {
     return (
@@ -603,80 +662,89 @@ function ExecuteTable({ rows }: { rows: ExecuteEventRow[] }) {
         </thead>
         <tbody>
           {rows.map((r) => (
-            <tr
-              key={r.event_id}
-              className={clsx(
-                "border-t border-[hsl(var(--border))] hover:bg-[hsl(var(--muted))]/40",
-                !r.eligible && "opacity-70",
+            <Fragment key={r.event_id}>
+              <tr
+                className={clsx(
+                  "border-t border-[hsl(var(--border))] hover:bg-[hsl(var(--muted))]/40",
+                  !r.eligible && "opacity-70",
+                )}
+              >
+                <Td className="font-mono">{r.event_id}</Td>
+                <Td>{r.event_type ?? "\u2014"}</Td>
+                <Td
+                  className="font-mono max-w-[300px] break-all"
+                  title={r.url ?? undefined}
+                >
+                  {r.url ? (
+                    <>
+                      <span className="font-semibold">{r.method}</span> {r.url}
+                    </>
+                  ) : (
+                    <span className="text-[hsl(var(--danger))]">
+                      not replayable
+                    </span>
+                  )}
+                </Td>
+                <Td>
+                  {r.consumer_status ? (
+                    <span
+                      className={clsx("pill", statusPillClass(r.consumer_status))}
+                    >
+                      {r.consumer_status}
+                    </span>
+                  ) : (
+                    <span className="text-[hsl(var(--muted-foreground))]">
+                      no row
+                    </span>
+                  )}
+                </Td>
+                <Td>
+                  {r.http_status == null ? (
+                    "\u2014"
+                  ) : (
+                    <span className={clsx("pill", httpPillClass(r.http_status))}>
+                      {r.http_status}
+                    </span>
+                  )}
+                </Td>
+                <Td
+                  className="max-w-[220px] truncate"
+                  title={r.response ?? undefined}
+                >
+                  {r.response ?? "\u2014"}
+                </Td>
+                <Td>{r.db_updated ? "\u2713" : "\u2014"}</Td>
+                <Td className="max-w-[280px]">
+                  {r.warnings.length === 0 ? (
+                    "\u2014"
+                  ) : (
+                    <ul className="space-y-1">
+                      {r.warnings.map((w, i) => (
+                        <li
+                          key={i}
+                          className={clsx(
+                            "text-[11px] leading-snug",
+                            r.eligible
+                              ? "text-amber-600 dark:text-amber-400"
+                              : "text-[hsl(var(--danger))]",
+                          )}
+                        >
+                          {w}
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </Td>
+              </tr>
+
+              {r.curl && (
+                <tr className="bg-[hsl(var(--danger))]/5">
+                  <td colSpan={8} className="px-3 py-2">
+                    <CurlBlock curl={r.curl} />
+                  </td>
+                </tr>
               )}
-            >
-              <Td className="font-mono">{r.event_id}</Td>
-              <Td>{r.event_type ?? "\u2014"}</Td>
-              <Td
-                className="font-mono max-w-[300px] break-all"
-                title={r.url ?? undefined}
-              >
-                {r.url ? (
-                  <>
-                    <span className="font-semibold">{r.method}</span> {r.url}
-                  </>
-                ) : (
-                  <span className="text-[hsl(var(--danger))]">
-                    not replayable
-                  </span>
-                )}
-              </Td>
-              <Td>
-                {r.consumer_status ? (
-                  <span
-                    className={clsx("pill", statusPillClass(r.consumer_status))}
-                  >
-                    {r.consumer_status}
-                  </span>
-                ) : (
-                  <span className="text-[hsl(var(--muted-foreground))]">
-                    no row
-                  </span>
-                )}
-              </Td>
-              <Td>
-                {r.http_status == null ? (
-                  "\u2014"
-                ) : (
-                  <span className={clsx("pill", httpPillClass(r.http_status))}>
-                    {r.http_status}
-                  </span>
-                )}
-              </Td>
-              <Td
-                className="max-w-[220px] truncate"
-                title={r.response ?? undefined}
-              >
-                {r.response ?? "\u2014"}
-              </Td>
-              <Td>{r.db_updated ? "\u2713" : "\u2014"}</Td>
-              <Td className="max-w-[280px]">
-                {r.warnings.length === 0 ? (
-                  "\u2014"
-                ) : (
-                  <ul className="space-y-1">
-                    {r.warnings.map((w, i) => (
-                      <li
-                        key={i}
-                        className={clsx(
-                          "text-[11px] leading-snug",
-                          r.eligible
-                            ? "text-amber-600 dark:text-amber-400"
-                            : "text-[hsl(var(--danger))]",
-                        )}
-                      >
-                        {w}
-                      </li>
-                    ))}
-                  </ul>
-                )}
-              </Td>
-            </tr>
+            </Fragment>
           ))}
         </tbody>
       </table>

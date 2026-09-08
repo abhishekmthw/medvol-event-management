@@ -151,6 +151,12 @@ export type ExecuteEventRow = {
   url: string | null;
   /** Current V2 event_consumer_status.event_status, null when there is no row. */
   consumer_status: string | null;
+  /**
+   * Copy-pasteable curl for the request AS SENT, credentials included —
+   * populated ONLY when the call failed, so a rejection can be replayed in
+   * Postman without hand-rebuilding it. Null on success and in preview.
+   */
+  curl: string | null;
   /** False when the event cannot be replayed at all (see `warnings`). */
   eligible: boolean;
   /**
