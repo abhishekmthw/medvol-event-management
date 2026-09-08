@@ -4,6 +4,7 @@ import {
   clearBatchEvents,
   clearByEventIds,
   clearByStreamIds,
+  executeExpiredEvents,
   refireByEventIds,
 } from "@/lib/events";
 import { getInstance } from "@/lib/instances";
@@ -17,6 +18,7 @@ const ALLOWED_ACTIONS: ActionKey[] = [
   "refire-by-event-ids",
   "clear-by-stream-ids",
   "clear-batch",
+  "execute-expired-events",
   "status",
 ];
 
@@ -104,6 +106,9 @@ export async function POST(req: Request) {
         break;
       case "clear-batch":
         result = await clearBatchEvents(target, input, { preview });
+        break;
+      case "execute-expired-events":
+        result = await executeExpiredEvents(target, input, { preview });
         break;
       case "status":
         result = await checkStatus(target, input);

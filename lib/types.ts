@@ -20,6 +20,7 @@ export type ActionKey =
   | "refire-by-event-ids"
   | "clear-by-stream-ids"
   | "clear-batch"
+  | "execute-expired-events"
   | "status";
 
 export const ACTIONS: {
@@ -71,6 +72,17 @@ export const ACTIONS: {
     danger: true,
   },
   {
+    key: "execute-expired-events",
+    label: "Execute Expired Events",
+    description:
+      "Replay events straight at the backend API (the call the V2 consumer would have made). For events whose SQS receipt has expired and can no longer be refired.",
+    inputLabel: "Event IDs",
+    inputPlaceholder: "32099701, 62614147",
+    inputHint:
+      "Comma-separated numeric event IDs. Each is re-sent to the LIVE backend as a real business write \u2014 preview shows the exact URL, method and current status per event.",
+    danger: true,
+  },
+  {
     key: "status",
     label: "Check Status",
     description:
@@ -107,6 +119,52 @@ export type BatchStatusRow = {
   force_status: boolean;
   data: unknown;
   modified_date: string | null;
+};
+
+/**
+ * Consumer statuses that mean the event already applied, so re-running it
+ * duplicates the business change. Lives here because both the server action
+ * and the client preview need it, and `lib/events.ts` cannot be imported from
+ * a client component (it pulls in `pg` via `lib/db.ts`).
+ */
+export const APPLIED_EVENT_STATUSES = ["success", "forcesuccess"];
+
+/** True when a consumer status means the event has already been applied. */
+export function isAppliedStatus(status: string | null): boolean {
+  return APPLIED_EVENT_STATUSES.includes((status ?? "").toLowerCase());
+}
+
+/**
+ * One event resolved for the "Execute Expired Events" action. Carries the
+ * reconstructed request (so the preview shows exactly what will be sent) and,
+ * after a run, the HTTP outcome.
+ */
+export type ExecuteEventRow = {
+  event_id: string;
+  stream_id: string | null;
+  event_type: string | null;
+  destination: string | null;
+  domain: string | null;
+  action: string | null;
+  method: string | null;
+  /** Fully-resolved target URL, or null when the event is ineligible. */
+  url: string | null;
+  /** Current V2 event_consumer_status.event_status, null when there is no row. */
+  consumer_status: string | null;
+  /** False when the event cannot be replayed at all (see `warnings`). */
+  eligible: boolean;
+  /**
+   * Ineligibility reasons and non-blocking cautions — including the
+   * "already Success, re-applying will duplicate" notice, which is the main
+   * safety net now that any event ID may be executed regardless of status.
+   */
+  warnings: string[];
+  /** HTTP status after a run; null in preview or when the call never completed. */
+  http_status: number | null;
+  /** Response body after a run (truncated for display); null in preview. */
+  response: string | null;
+  /** True when the 2xx response led to the consumer-status row being updated. */
+  db_updated: boolean;
 };
 
 /* ------------------------------------------------------------------ *
@@ -167,6 +225,8 @@ export type OperationResult = {
   errors: { id: string | number; reason: string }[];
   events?: EventStatusRow[];
   batch?: BatchStatusRow[];
+  /** Rows for the "Execute Expired Events" action (preview + run). */
+  executed?: ExecuteEventRow[];
   /** When true, no mutations were performed; rows shown are candidates. */
   preview?: boolean;
   /** Number of rows that would be mutated if executed (preview only). */

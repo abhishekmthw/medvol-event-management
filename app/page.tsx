@@ -16,6 +16,7 @@ import {
   Loader2,
   RefreshCcw,
   Search,
+  Send,
   ShieldAlert,
   Wand2,
   X,
@@ -26,10 +27,12 @@ import { Segmented } from "@/components/segmented";
 import { FormatIdsModal } from "@/components/format-ids-modal";
 import {
   ACTIONS,
+  isAppliedStatus,
   type ActionKey,
   type BatchStatusRow,
   type Environment,
   type EventStatusRow,
+  type ExecuteEventRow,
   type InstanceOption,
   type OperationResult,
   type Service,
@@ -40,6 +43,7 @@ const ACTION_ICONS: Record<ActionKey, JSX.Element> = {
   "refire-by-event-ids": <RefreshCcw className="h-4 w-4" />,
   "clear-by-stream-ids": <Layers className="h-4 w-4" />,
   "clear-batch": <Database className="h-4 w-4" />,
+  "execute-expired-events": <Send className="h-4 w-4" />,
   status: <Search className="h-4 w-4" />,
 };
 
@@ -313,9 +317,11 @@ export default function DashboardPage() {
 
           <div className="flex flex-wrap items-center justify-between gap-3">
             <p className="text-xs text-[hsl(var(--muted-foreground))]">
-              {isDestructive
-                ? "Preview will show affected rows before any database change."
-                : "This is a read-only operation."}
+              {!isDestructive
+                ? "This is a read-only operation."
+                : action === "execute-expired-events"
+                  ? "Preview will show the exact request built for each event before anything is sent."
+                  : "Preview will show affected rows before any database change."}
             </p>
             <button
               type="button"
@@ -472,7 +478,6 @@ function ResultsModal({
   action: ActionKey;
   onClose: () => void;
 }) {
-  const isBatch = action === "clear-batch";
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
       <div className="card-strong max-w-4xl w-full max-h-[90vh] flex flex-col">
@@ -539,9 +544,7 @@ function ResultsModal({
             </details>
           )}
 
-          {isBatch
-            ? <BatchTable rows={result.batch ?? []} />
-            : <EventTable rows={result.events ?? []} />}
+          {renderResultTable(action, result)}
         </div>
 
         <div className="flex justify-end gap-2 px-6 py-4 border-t border-[hsl(var(--border))]">
@@ -550,6 +553,133 @@ function ResultsModal({
           </button>
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Picks the results table for an action. Preview and results modals share it,
+ * so a new action needs one branch here rather than an edit in both places.
+ */
+function renderResultTable(action: ActionKey, result: OperationResult) {
+  if (action === "clear-batch") {
+    return <BatchTable rows={result.batch ?? []} />;
+  }
+  if (action === "execute-expired-events") {
+    return <ExecuteTable rows={result.executed ?? []} />;
+  }
+  return <EventTable rows={result.events ?? []} />;
+}
+
+function httpPillClass(status: number): string {
+  if (status >= 200 && status < 300) {
+    return "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400";
+  }
+  return "bg-red-500/15 text-red-600 dark:text-red-400";
+}
+
+function ExecuteTable({ rows }: { rows: ExecuteEventRow[] }) {
+  if (rows.length === 0) {
+    return (
+      <p className="text-sm text-[hsl(var(--muted-foreground))] py-4 text-center">
+        No events to display.
+      </p>
+    );
+  }
+  return (
+    <div className="overflow-x-auto rounded-lg border border-[hsl(var(--border))]">
+      <table className="w-full text-xs">
+        <thead className="bg-[hsl(var(--muted))]/60 text-[hsl(var(--muted-foreground))]">
+          <tr>
+            <Th>Event ID</Th>
+            <Th>Event Type</Th>
+            <Th>Request</Th>
+            <Th>V2 Status</Th>
+            <Th>HTTP</Th>
+            <Th>Response</Th>
+            <Th>DB</Th>
+            <Th>Notes</Th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr
+              key={r.event_id}
+              className={clsx(
+                "border-t border-[hsl(var(--border))] hover:bg-[hsl(var(--muted))]/40",
+                !r.eligible && "opacity-70",
+              )}
+            >
+              <Td className="font-mono">{r.event_id}</Td>
+              <Td>{r.event_type ?? "\u2014"}</Td>
+              <Td
+                className="font-mono max-w-[300px] break-all"
+                title={r.url ?? undefined}
+              >
+                {r.url ? (
+                  <>
+                    <span className="font-semibold">{r.method}</span> {r.url}
+                  </>
+                ) : (
+                  <span className="text-[hsl(var(--danger))]">
+                    not replayable
+                  </span>
+                )}
+              </Td>
+              <Td>
+                {r.consumer_status ? (
+                  <span
+                    className={clsx("pill", statusPillClass(r.consumer_status))}
+                  >
+                    {r.consumer_status}
+                  </span>
+                ) : (
+                  <span className="text-[hsl(var(--muted-foreground))]">
+                    no row
+                  </span>
+                )}
+              </Td>
+              <Td>
+                {r.http_status == null ? (
+                  "\u2014"
+                ) : (
+                  <span className={clsx("pill", httpPillClass(r.http_status))}>
+                    {r.http_status}
+                  </span>
+                )}
+              </Td>
+              <Td
+                className="max-w-[220px] truncate"
+                title={r.response ?? undefined}
+              >
+                {r.response ?? "\u2014"}
+              </Td>
+              <Td>{r.db_updated ? "\u2713" : "\u2014"}</Td>
+              <Td className="max-w-[280px]">
+                {r.warnings.length === 0 ? (
+                  "\u2014"
+                ) : (
+                  <ul className="space-y-1">
+                    {r.warnings.map((w, i) => (
+                      <li
+                        key={i}
+                        className={clsx(
+                          "text-[11px] leading-snug",
+                          r.eligible
+                            ? "text-amber-600 dark:text-amber-400"
+                            : "text-[hsl(var(--danger))]",
+                        )}
+                      >
+                        {w}
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </Td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -704,9 +834,16 @@ function PreviewModal({
   onCancel: () => void;
   onConfirm: () => void;
 }) {
-  const isBatch = action === "clear-batch";
   const count = preview.candidates ?? 0;
   const nothingToDo = count === 0;
+  const isExecute = action === "execute-expired-events";
+  // Any event ID is executable regardless of status, so the count of events
+  // that ALREADY applied is the warning the operator most needs here.
+  const alreadyApplied = isExecute
+    ? (preview.executed ?? []).filter(
+        (r) => r.eligible && isAppliedStatus(r.consumer_status),
+      ).length
+    : 0;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-fade-in">
@@ -775,20 +912,42 @@ function PreviewModal({
               {count}
             </span>
             <span className="text-xs text-[hsl(var(--muted-foreground))]">
-              row{count === 1 ? "" : "s"} will be modified if you confirm.
-              {isProd && !nothingToDo
-                ? " This is the production database."
-                : ""}
+              {isExecute ? (
+                <>
+                  event{count === 1 ? "" : "s"} will be sent to the live backend
+                  as real business writes if you confirm.
+                  {isProd && !nothingToDo ? " This is production." : ""}
+                </>
+              ) : (
+                <>
+                  row{count === 1 ? "" : "s"} will be modified if you confirm.
+                  {isProd && !nothingToDo
+                    ? " This is the production database."
+                    : ""}
+                </>
+              )}
             </span>
           </div>
+
+          {alreadyApplied > 0 && (
+            <div
+              className="mt-3 rounded-lg border border-[hsl(var(--danger))]/40 bg-[hsl(var(--danger))]/10
+                         px-3 py-2 text-xs flex items-start gap-2 text-[hsl(var(--danger))]"
+            >
+              <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
+              <span>
+                {alreadyApplied} of these event
+                {alreadyApplied === 1 ? " has" : "s have"} already been applied
+                (V2 status Success). Re-running{" "}
+                {alreadyApplied === 1 ? "it" : "them"} will apply the same change
+                a second time — check the Notes column before confirming.
+              </span>
+            </div>
+          )}
         </div>
 
         <div className="px-6 pb-3 overflow-auto flex-1">
-          {isBatch ? (
-            <BatchTable rows={preview.batch ?? []} />
-          ) : (
-            <EventTable rows={preview.events ?? []} />
-          )}
+          {renderResultTable(action, preview)}
         </div>
 
         <div className="flex justify-end gap-2 px-6 py-4 border-t border-[hsl(var(--border))]">

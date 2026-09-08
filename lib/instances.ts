@@ -11,6 +11,7 @@ import type { Service } from "./types";
  *   PRIVATE_INSTANCES=lupin,alpha
  *   PRIVATE_INSTANCE_LUPIN_LABEL=Lupin
  *   PRIVATE_INSTANCE_LUPIN_SERVICE=oms
+ *   PRIVATE_INSTANCE_LUPIN_COMPANY_CODE=…
  *   PRIVATE_INSTANCE_LUPIN_PROD_DB_HOST=…
  *   PRIVATE_INSTANCE_LUPIN_PROD_DB_USER=…
  *   PRIVATE_INSTANCE_LUPIN_PROD_DB_NAME=…
@@ -25,6 +26,17 @@ export type InstanceMeta = {
   id: string;
   label: string;
   service: Service;
+  /**
+   * The company code that routes a request to this instance. The OMS API
+   * Gateway is SHARED by the common instance and every private one — the
+   * Company Mapper Service picks the target instance from the `company_code`
+   * request header (see `md-batch-lambda/lambda/event-api-creation`, which
+   * sets `headers["company_code"]` the same way). Only needed by the
+   * "Execute Expired Events" action; the DB/SQS actions address the instance
+   * directly through its own credentials, so this stays optional here and is
+   * enforced at the point of use (`lib/consumer-api.ts`).
+   */
+  companyCode: string | null;
 };
 
 function envPrefix(id: string): string {
@@ -67,7 +79,8 @@ function readOne(id: string): InstanceMeta | null {
     );
     return null;
   }
-  return { id, label, service: serviceRaw };
+  const companyCode = process.env[`${prefix}_COMPANY_CODE`]?.trim() || null;
+  return { id, label, service: serviceRaw, companyCode };
 }
 
 let cache: InstanceMeta[] | null = null;

@@ -1,9 +1,19 @@
+import {
+  buildConsumerRequest,
+  callConsumerApi,
+  describeConsumerRoute,
+  resolveConsumerApi,
+  SUPPORTED_DESTINATION,
+  type ConsumerEventInput,
+} from "./consumer-api";
 import { getPool } from "./db";
 import { deleteSqsBatchScheduler } from "./playground";
 import { deleteSqsMessage, refireSqsMessage } from "./sqs";
+import { isAppliedStatus } from "./types";
 import type {
   BatchStatusRow,
   EventStatusRow,
+  ExecuteEventRow,
   OperationResult,
   Target,
 } from "./types";
@@ -106,17 +116,19 @@ async function fetchEventStatusRows(
   }));
 }
 
+/** Returns the number of consumer-status rows actually updated. */
 async function markEventForceSuccess(
   target: Target,
   eventId: string | number,
-): Promise<void> {
+): Promise<number> {
   const pool = getPool(target);
-  await pool.query(
+  const res = await pool.query(
     `UPDATE public.event_consumer_status
      SET event_status = 'Success', "forceStatus" = true
      WHERE eventid = $1 AND consumer_name = $2`,
     [eventId, CONSUMER],
   );
+  return res.rowCount ?? 0;
 }
 
 export async function checkStatus(
@@ -516,5 +528,364 @@ export async function clearBatchEvents(
     cleared,
     errors,
     batch: currentRows as BatchStatusRow[],
+  };
+}
+
+/* ------------------------------------------------------------------ *
+ * Execute Expired Events — replays a stored event straight at the
+ * backend API, reproducing the HTTP call the V2 SQS consumer would
+ * have made. For events whose SQS receipt handle has aged out (>14 day
+ * retention), where `refire-by-event-ids` can no longer re-deliver.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Per-run cap. Each call can take up to `CONSUMER_API_FETCH_TIMEOUT_MS`
+ * (30s default), so a large paste would blow the serverless wall-clock.
+ */
+const MAX_EXECUTE_IDS = 50;
+
+/** How many events are in flight at once (the script used a batch of 5). */
+const EXECUTE_CONCURRENCY = 4;
+
+/** Response bodies are echoed to the UI — cap what we carry per row. */
+const RESPONSE_PREVIEW_LIMIT = 2000;
+
+type RawEventRow = {
+  event_id: string;
+  stream_id: string | null;
+  event_type: string | null;
+  destination: string | null;
+  domain: string | null;
+  action: string | null;
+  method: string | null;
+  data: string | null;
+  user_details: string | null;
+};
+
+function truncateResponse(raw: string): string {
+  return raw.length > RESPONSE_PREVIEW_LIMIT
+    ? `${raw.slice(0, RESPONSE_PREVIEW_LIMIT)}… (truncated)`
+    : raw;
+}
+
+/**
+ * Loads the event rows plus their current V2 consumer status.
+ *
+ * Deliberately TWO queries joined in Node rather than one SQL join: joining
+ * `event_consumer_status` to `public.events` forced a Seq Scan on the
+ * multi-million-row events table in prod and caused 504s (see the note in
+ * `fetchEventStatusRows`). Each query here uses the cast its own indexed
+ * column wants — `::bigint` for `events."eventId"`, `::numeric` for
+ * `event_consumer_status.eventid`.
+ */
+async function fetchEventsForExecute(
+  target: Target,
+  eventIds: number[],
+): Promise<{ events: RawEventRow[]; statuses: Map<string, string> }> {
+  const pool = getPool(target);
+
+  const { rows } = await pool.query(
+    `SELECT
+       e."eventId"::text       AS event_id,
+       e."eventStreamStreamId" AS stream_id,
+       e.event_type,
+       e.destination,
+       e.domain,
+       e.action,
+       e.method,
+       e.data::text            AS data,
+       e."userDetails"::text   AS user_details
+     FROM public.events e
+     WHERE e."eventId" = ANY($1::bigint[])
+     ORDER BY e."eventId"`,
+    [eventIds],
+  );
+  const events = rows as RawEventRow[];
+
+  const statuses = new Map<string, string>();
+  if (events.length) {
+    const { rows: statusRows } = await pool.query(
+      `SELECT eventid::text AS event_id, event_status
+       FROM public.event_consumer_status
+       WHERE eventid = ANY($1::numeric[]) AND consumer_name = $2`,
+      [events.map((e) => e.event_id), CONSUMER],
+    );
+    for (const r of statusRows as { event_id: string; event_status: string }[]) {
+      statuses.set(r.event_id, r.event_status);
+    }
+  }
+
+  return { events, statuses };
+}
+
+/**
+ * Resolves one raw event row into a display/execution row: parses
+ * `userDetails`, decides eligibility, and collects the cautions the operator
+ * needs to see BEFORE confirming.
+ */
+function resolveExecuteRow(
+  target: Target,
+  raw: RawEventRow,
+  consumerStatus: string | null,
+  cfg: ReturnType<typeof resolveConsumerApi>,
+): { row: ExecuteEventRow; input: ConsumerEventInput | null } {
+  const warnings: string[] = [];
+
+  let userDetails: Record<string, unknown> | null = null;
+  if (raw.user_details) {
+    try {
+      const parsed = JSON.parse(raw.user_details);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        userDetails = parsed as Record<string, unknown>;
+      }
+    } catch {
+      warnings.push(
+        "userDetails is not valid JSON — the call will be sent with the machine (AuthMachine) identity instead.",
+      );
+    }
+  }
+  if (!userDetails || !Object.keys(userDetails).length) {
+    warnings.push(
+      "No userDetails on the event — the backend will attribute this write to the machine identity (AuthMachine).",
+    );
+  }
+
+  // Hard ineligibility: the real consumer could not build a request either.
+  const problems: string[] = [];
+  if ((raw.destination ?? "") !== SUPPORTED_DESTINATION) {
+    problems.push(
+      `destination is "${raw.destination ?? "null"}" — only "${SUPPORTED_DESTINATION}" maps to a backend URL (the consumer itself returns 400 for anything else).`,
+    );
+  }
+  if (!raw.domain?.trim()) problems.push("domain is empty.");
+  if (!raw.action?.trim()) problems.push("action is empty.");
+  if (!raw.method?.trim()) problems.push("method is empty.");
+
+  const eligible = problems.length === 0;
+
+  // Cautions that do NOT block — the operator decides.
+  if (eligible) {
+    const statusKey = (consumerStatus ?? "").toLowerCase();
+    if (isAppliedStatus(consumerStatus)) {
+      warnings.push(
+        `Already ${consumerStatus} — this event has been applied. Re-running it will apply the same change a SECOND time.`,
+      );
+    } else if (!consumerStatus) {
+      warnings.push(
+        "No V2 consumer-status row — the call will be made, but there is no row to mark Success afterwards.",
+      );
+    } else if (statusKey === "queue") {
+      warnings.push(
+        `Status is ${consumerStatus} — the SQS message may still be live and could be delivered later, applying this change twice.`,
+      );
+    }
+    if (target.service === "corp" && (raw.method ?? "").trim().toUpperCase() === "GET") {
+      warnings.push(
+        "Method is GET — the Corp API-key authorizer only allows non-GET /api/v1 paths unless the route is explicitly whitelisted, so this is likely to be denied.",
+      );
+    }
+  }
+
+  const input: ConsumerEventInput | null = eligible
+    ? {
+        eventId: raw.event_id,
+        streamId: raw.stream_id,
+        eventType: raw.event_type,
+        domain: raw.domain!.trim(),
+        action: raw.action!.trim(),
+        method: raw.method!.trim(),
+        data: raw.data,
+        userDetails,
+      }
+    : null;
+
+  const url = input ? buildConsumerRequest(target, input, cfg).url : null;
+
+  return {
+    row: {
+      event_id: raw.event_id,
+      stream_id: raw.stream_id,
+      event_type: raw.event_type,
+      destination: raw.destination,
+      domain: raw.domain,
+      action: raw.action,
+      method: raw.method,
+      url,
+      consumer_status: consumerStatus,
+      eligible,
+      warnings: [...problems, ...warnings],
+      http_status: null,
+      response: null,
+      db_updated: false,
+    },
+    input,
+  };
+}
+
+/**
+ * Replays the given event IDs against the target's backend API.
+ *
+ * Accepts ANY event ID present in `public.events` regardless of its consumer
+ * status (user-directed), so the preview is the safety net: it shows the
+ * resolved URL, the current status and an explicit warning on every event that
+ * has already been applied. On a 2xx the V2 consumer-status row is marked
+ * `Success` / `forceStatus = true`; SQS is never touched.
+ */
+export async function executeExpiredEvents(
+  target: Target,
+  input: string,
+  options: { preview?: boolean } = {},
+): Promise<OperationResult> {
+  const { eventIds, streamIds } = partitionIdentifiers(input);
+  const errors: OperationResult["errors"] = streamIds.map((t) => ({
+    id: t,
+    reason: "Not a numeric event ID — this operation accepts event IDs only.",
+  }));
+
+  if (!eventIds.length) {
+    return {
+      ok: false,
+      message: "No numeric event IDs found in input.",
+      attempted: 0,
+      cleared: 0,
+      errors,
+      executed: [],
+    };
+  }
+  if (eventIds.length > MAX_EXECUTE_IDS) {
+    return {
+      ok: false,
+      message: `Too many event IDs (${eventIds.length}). Run at most ${MAX_EXECUTE_IDS} at a time — each event is a live HTTP call.`,
+      attempted: 0,
+      cleared: 0,
+      errors,
+      executed: [],
+    };
+  }
+
+  // Resolved once up front: a missing base URL / API key should fail the whole
+  // request loudly (the route surfaces the message) rather than per event.
+  const cfg = resolveConsumerApi(target);
+
+  const { events, statuses } = await fetchEventsForExecute(target, eventIds);
+
+  const found = new Set(events.map((e) => e.event_id));
+  for (const id of eventIds) {
+    if (!found.has(String(id))) {
+      errors.push({ id, reason: "Event ID not found in public.events." });
+    }
+  }
+
+  const resolved = events.map((raw) =>
+    resolveExecuteRow(target, raw, statuses.get(raw.event_id) ?? null, cfg),
+  );
+  const rows = resolved.map((r) => r.row);
+  // Type predicate so the run loop needs no non-null assertion on `input`.
+  const runnable = resolved.filter(
+    (r): r is { row: ExecuteEventRow; input: ConsumerEventInput } =>
+      r.input !== null,
+  );
+
+  if (options.preview) {
+    const alreadyApplied = rows.filter(
+      (r) => r.eligible && isAppliedStatus(r.consumer_status),
+    ).length;
+    const notFailed = rows.filter(
+      (r) => r.eligible && (r.consumer_status ?? "").toLowerCase() !== "failed",
+    ).length;
+
+    const parts: string[] = [];
+    if (runnable.length) {
+      parts.push(
+        `${runnable.length} event${runnable.length === 1 ? "" : "s"} will be sent to the live ${target.service.toUpperCase()} backend at ${describeConsumerRoute(target, cfg)}.`,
+      );
+    } else {
+      parts.push("No event can be replayed. Nothing would be sent.");
+    }
+    if (alreadyApplied) {
+      parts.push(
+        `${alreadyApplied} ${alreadyApplied === 1 ? "has" : "have"} already been applied — re-running ${alreadyApplied === 1 ? "it" : "them"} duplicates the change.`,
+      );
+    } else if (notFailed) {
+      parts.push(`${notFailed} ${notFailed === 1 ? "is" : "are"} not in Failed state.`);
+    }
+
+    return {
+      ok: true,
+      preview: true,
+      candidates: runnable.length,
+      message: parts.join(" "),
+      attempted: 0,
+      cleared: 0,
+      errors,
+      executed: rows,
+    };
+  }
+
+  for (const r of resolved) {
+    if (!r.input) {
+      errors.push({
+        id: r.row.event_id,
+        reason: `Cannot be replayed: ${r.row.warnings.join(" ")}`,
+      });
+    }
+  }
+
+  let succeeded = 0;
+  let dbUpdated = 0;
+
+  for (let i = 0; i < runnable.length; i += EXECUTE_CONCURRENCY) {
+    const batch = runnable.slice(i, i + EXECUTE_CONCURRENCY);
+    await Promise.all(
+      batch.map(async ({ row, input: ev }) => {
+        const req = buildConsumerRequest(target, ev, cfg);
+        const out = await callConsumerApi(req);
+        row.http_status = out.status;
+        row.response = truncateResponse(out.raw);
+
+        if (!out.ok) {
+          errors.push({
+            id: row.event_id,
+            reason: `HTTP ${out.status ?? "—"}: ${truncateResponse(out.raw) || "<empty>"}\nRequest:\n${out.curl}`,
+          });
+          return;
+        }
+
+        succeeded++;
+        // 2xx — mark the consumer-status row Success. SQS is deliberately left
+        // alone for this action.
+        try {
+          const updated = await markEventForceSuccess(target, row.event_id);
+          row.db_updated = updated > 0;
+          if (updated > 0) dbUpdated++;
+          else {
+            row.warnings.push(
+              "Call succeeded but no V2 consumer-status row existed to update.",
+            );
+          }
+        } catch (e) {
+          errors.push({
+            id: row.event_id,
+            reason: `Call succeeded (HTTP ${out.status}) but the consumer-status update failed: ${
+              e instanceof Error ? e.message : String(e)
+            }`,
+          });
+        }
+      }),
+    );
+  }
+
+  const failedCalls = runnable.length - succeeded;
+  const message = runnable.length
+    ? `Executed ${runnable.length} event${runnable.length === 1 ? "" : "s"}: ${succeeded} succeeded, ${failedCalls} failed. ${dbUpdated} consumer-status row${dbUpdated === 1 ? "" : "s"} marked Success.`
+    : "No event could be replayed — nothing was sent.";
+
+  return {
+    ok: errors.length === 0,
+    message,
+    attempted: runnable.length,
+    cleared: succeeded,
+    errors,
+    executed: rows,
   };
 }
