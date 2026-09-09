@@ -816,3 +816,156 @@ export type EmployeeCognitoChunk = {
   /** Mismatched employees found in this chunk. */
   rows: EmployeeCognitoRow[];
 };
+
+/* ------------------------------------------------------------------ *
+ * Admin Events — bulk `ADMIN_EDIT` V2 event push for admin users, plus
+ * the Cognito CUSTOM_AUTH token minting the push authenticates with.
+ * Reads the auth DB (`Admin_Users`, `Companies`, `Divisions`) and PUTs
+ * one event per user at the auth-backend API Gateway.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Which access shape auth-backend's `getAdminRoleAccess` gives this role, and
+ * therefore whether the `companies` array is load-bearing in the event body.
+ *  - `all-companies`      → every company is resolved server-side; anything we
+ *                           send in `companies` is ignored, so we omit it.
+ *  - `specific-companies` → `getAllCompaniesWithDivisions(companyIds)` runs on
+ *                           exactly what we send, and a non-empty array is
+ *                           REQUIRED.
+ */
+export type AdminRoleGroup = "all-companies" | "specific-companies";
+
+/**
+ * Role ids whose access auth-backend resolves to EVERY company regardless of
+ * what is sent (`getAdminRoleAccess` → "ALL — Company, Division, State"), so
+ * the `companies` array is omitted from their event body.
+ *
+ * Copied verbatim from the ops script this tab replaces. NOTE role 35 is
+ * company-scoped in `auth-backend/src/utils/adminRoleAccess.ts` but appears in
+ * NEITHER of the script's lists, so it is deliberately out of scope here too —
+ * adding it is a separate decision, not a tidy-up.
+ *
+ * Lives here rather than in `lib/admin-events.ts` because the tab renders the
+ * lists before any request is made, and that module pulls in `pg` and the AWS
+ * SDK — importing it from a client component would drag both into the browser
+ * bundle. Same reason `OTP_USER_TYPES` lives here.
+ */
+export const ALL_COMPANY_ROLE_IDS: readonly string[] = Object.freeze([
+  "1",
+  "6",
+  "12",
+  "16",
+  "21",
+  "22",
+  "23",
+  "24",
+  "25",
+  "26",
+  "27",
+  "29",
+  "36",
+]);
+
+/**
+ * Role ids for which auth-backend calls
+ * `getAllCompaniesWithDivisions(companyIds)` on exactly what is sent — so
+ * `companies` is load-bearing and a non-empty array is REQUIRED.
+ */
+export const SPECIFIC_COMPANY_ROLE_IDS: readonly string[] = Object.freeze([
+  "19",
+  "20",
+]);
+
+/**
+ * How many previewed users the UI sends per apply request. Small enough that a
+ * chunk finishes well inside a serverless timeout, and inside the 5-minute life
+ * of the access token the server mints for it.
+ */
+export const ADMIN_EVENT_CHUNK = 25;
+
+/** An `Admin_Users` row eligible for the push, tagged with its role group. */
+export type AdminEventUser = {
+  /** bigint in Postgres — kept as the string `pg` returns it as. */
+  id: string;
+  name: string | null;
+  email: string | null;
+  mobile_no: string | null;
+  code: string | null;
+  ucode: string | null;
+  /** bigint in Postgres — kept as a string, as the source script sent it. */
+  user_role_id: string;
+  active_status: string | null;
+  group: AdminRoleGroup;
+};
+
+/** An active company that has at least one active division. */
+export type AdminEventCompany = {
+  id: string;
+  name: string | null;
+};
+
+/** Outcome of the `PUT /event/admin/edit` call for one user. */
+export type AdminEventRow = {
+  id: string;
+  name: string | null;
+  mobile_no: string | null;
+  user_role_id: string;
+  group: AdminRoleGroup;
+  ok: boolean;
+  /** HTTP status, or null when the request never completed. */
+  status: number | null;
+  /** Response body on success, or the failure reason. */
+  detail: string;
+};
+
+/** Read-only result of the preview pass — no token minted, nothing sent. */
+export type AdminEventPreview = {
+  ok: boolean;
+  preview: true;
+  message: string;
+  /** Every user the run would push, in id order. */
+  users: AdminEventUser[];
+  /** Counts per role group. */
+  allCompaniesCount: number;
+  specificCompaniesCount: number;
+  /** Companies resolved once for the `specific-companies` group. */
+  companies: AdminEventCompany[];
+  /** The endpoint the run will PUT to (no credentials). */
+  endpoint: string;
+  /** Conditions that must be resolved before the run may proceed. */
+  blockers: string[];
+  /** Supplied mobile numbers that matched no eligible admin user. */
+  notes: { mobile: string; reason: string }[];
+};
+
+/** Result of one applied chunk. The client concatenates `rows` across chunks. */
+export type AdminEventRunResult = {
+  ok: boolean;
+  message: string;
+  /** Users actually sent in this chunk. */
+  attempted: number;
+  /** Of those, how many returned 2xx. */
+  succeeded: number;
+  /** Of those, how many did not. */
+  failed: number;
+  rows: AdminEventRow[];
+  /**
+   * Previewed ids that no longer matched the eligibility filter when the chunk
+   * ran — skipped rather than sent with stale data.
+   */
+  skipped: { id: string; reason: string }[];
+};
+
+/** Tokens returned by the standalone "Generate token" card. */
+export type AdminTokenResult = {
+  ok: boolean;
+  /** The `Authorization` header value, ready to paste. */
+  bearer: string;
+  accessToken: string;
+  idToken: string | null;
+  refreshToken: string | null;
+  /** Access-token expiry as an ISO timestamp, decoded from its `exp` claim. */
+  expiresAt: string | null;
+  /** The mobile the token was minted for, normalised to 10 digits. */
+  mobile: string;
+};

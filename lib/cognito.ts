@@ -4,6 +4,7 @@ import {
   AdminUpdateUserAttributesCommand,
   CognitoIdentityProviderClient,
   CognitoIdentityProviderServiceException,
+  InitiateAuthCommand,
   ListUsersCommand,
   type AdminGetUserCommandOutput,
   type UserType,
@@ -324,4 +325,94 @@ export function describeCognitoError(err: unknown, op = "ListUsers"): string {
     if (meta?.requestId) parts.push(`requestId=${meta.requestId}`);
   }
   return parts.join(" ");
+}
+
+/* ------------------------------------------------------------------ *
+ * CUSTOM_AUTH token minting — used by the Admin Events tab.
+ * ------------------------------------------------------------------ */
+
+export type CognitoAuthTokens = {
+  accessToken: string;
+  idToken: string | null;
+  refreshToken: string | null;
+  /** `exp` claim of the access token as epoch ms, or null if undecodable. */
+  expiresAtMs: number | null;
+};
+
+/**
+ * The `exp` claim of a JWT, as epoch milliseconds. The signature is NOT
+ * verified — the token came straight from Cognito over TLS; this only reads
+ * when it dies so the caller can re-mint before it does. Returns null on
+ * anything unexpected, so a decode failure degrades to "no known expiry"
+ * rather than throwing.
+ */
+function readJwtExpiryMs(jwt: string): number | null {
+  try {
+    const payload = jwt.split(".")[1];
+    if (!payload) return null;
+    const json = Buffer.from(
+      payload.replace(/-/g, "+").replace(/_/g, "/"),
+      "base64",
+    ).toString("utf8");
+    const exp = (JSON.parse(json) as { exp?: unknown }).exp;
+    return typeof exp === "number" ? exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Mint tokens for a mobile number through the pool's CUSTOM_AUTH flow — the
+ * `InitiateAuth` half of the ops `mobileLogin` script.
+ *
+ * Only `USERNAME` is supplied and no challenge is ever answered, yet tokens
+ * come back on the first call: `lambda-cognito-triggers`'
+ * `define-auth-challenge` sets `issueTokens = true` unconditionally (its real
+ * `adminVerify` / `loginApproved` gate is commented out), so Cognito skips
+ * straight to issuing them.
+ *
+ * Two side effects to know before calling this in a loop:
+ *   1. the trigger POSTs `/auth/removeOTP` for any number NOT in its
+ *      `PERMANENT_ADMIN_BYPASS_NUMBERS` list, so each mint clears that user's
+ *      pending OTP; and
+ *   2. the access token is short-lived (5 minutes on the prod app client).
+ * `getBulkToken` in `lib/admin-events.ts` caches on the decoded `exp` for
+ * exactly these reasons — do not mint per user.
+ *
+ * `InitiateAuth` is an unauthenticated Cognito API; the signed client is reused
+ * only for its region/credential wiring, and no extra IAM permission is needed.
+ */
+export async function initiateCustomAuth(
+  environment: Environment,
+  mobile10: string,
+): Promise<CognitoAuthTokens> {
+  const cfg = resolveConfig(environment);
+  const client = getClient(cfg);
+  const clientId = requireEnv(`${environment.toUpperCase()}_COGNITO_CLIENT_ID`);
+
+  const res = await client.send(
+    new InitiateAuthCommand({
+      AuthFlow: "CUSTOM_AUTH",
+      ClientId: clientId,
+      AuthParameters: { USERNAME: `+91${mobile10}` },
+    }),
+  );
+
+  const auth = res.AuthenticationResult;
+  if (!auth?.AccessToken) {
+    // A challenge came back instead of tokens — the trigger declined to issue
+    // them (unknown user, or the commented-out gate was restored upstream).
+    throw new Error(
+      `Cognito returned no access token for +91${mobile10}` +
+        (res.ChallengeName ? ` (challenge: ${res.ChallengeName})` : "") +
+        ". The user may not exist in this environment's pool.",
+    );
+  }
+
+  return {
+    accessToken: auth.AccessToken,
+    idToken: auth.IdToken ?? null,
+    refreshToken: auth.RefreshToken ?? null,
+    expiresAtMs: readJwtExpiryMs(auth.AccessToken),
+  };
 }
