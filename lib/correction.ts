@@ -5,6 +5,7 @@ import {
   generateRandomPhoneNumber,
   lookupByReservedMobile,
   lookupBySub,
+  lookupBySubDirect,
   releaseUserPhone,
   updateUserAttributes,
   updateUserPhone,
@@ -45,9 +46,12 @@ import type {
   CorrectionRepairStep,
   CorrectionReplayResult,
   CorrectionStoredSubOwner,
+  CorrectionSigninMismatchResult,
+  CorrectionSigninRepairAttempt,
   CorrectionSyncChange,
   CorrectionSyncResult,
   Environment,
+  SigninIndexVerdict,
 } from "./types";
 
 /**
@@ -2575,5 +2579,239 @@ export async function releaseReservedNumber(
     message: released
       ? `${displayMobile10(mobile10)} is now free — verified with AdminGetUser. A signup for it will go through the normal chain (Pre Sign-up → CustomMessage_SignUp → Post Confirmation), so the new account gets its own custom:* attributes and cognito_id.`
       : `${displayMobile10(mobile10)} is STILL reserved by ${describeAccount(holder)} after ${attempts.length} attempt(s). Nothing else was changed — do not retry blindly; read the attempt details.`,
+  });
+}
+
+/**
+ * Sign-in number mismatch — the inverse of `releaseReservedNumber`.
+ *
+ * That function answers "who is holding this number?". This one answers "does
+ * this account's number actually sign in?", which is a different failure and
+ * needs a different repair.
+ *
+ * The pool is `UsernameAttributes: ['phone_number']`, so a number lives in two
+ * indexes. `AdminGetUser` resolves the SIGN-IN identifier — the only lookup
+ * `InitiateAuth` agrees with. `ListUsers` and the Cognito console can only see
+ * the editable `phone_number` ATTRIBUTE. Per the AWS docs a changed number
+ * "becomes the new username" only when it is free AND the update is marked
+ * verified, so a write that left `phone_number_verified` unparseable (the
+ * capital-`"True"` auth-backend used to send) updates the attribute and strands
+ * the sign-in name on the OLD number.
+ *
+ * The account then looks perfect in the console while `mobile-verification`,
+ * `otp-verification` and the passwordless flow all throw
+ * `UserNotFoundException`. Unlike "Change Cognito mobile", this works for any
+ * user type — counters included, which is where it was first seen.
+ *
+ * The repair re-asserts the attribute WITH lowercase `"true"` and then re-probes
+ * the sign-in index. Success is only ever an observed move.
+ */
+export async function repairSigninMismatch(
+  environment: Environment,
+  input: { mobile?: string; sub?: string },
+  preview: boolean,
+): Promise<CorrectionSigninMismatchResult> {
+  const askedSub = norm(input.sub ?? "");
+  let mobile10 = normalizeMobile(input.mobile ?? "");
+
+  const base: CorrectionSigninMismatchResult = {
+    ok: false,
+    message: "",
+    mobile10,
+    verdict: "free",
+    attributeAccount: null,
+    signinAccount: null,
+    owners: [],
+    attempts: [],
+    repaired: false,
+    blockers: [],
+    warnings: [],
+    preview,
+  };
+
+  if (!askedSub && !mobile10) {
+    return { ...base, message: "Enter a 10-digit mobile number or a Cognito sub." };
+  }
+
+  const warnings: string[] = [];
+  let attributeHit: CognitoUserInfo | null = null;
+
+  // A sub is the stronger input: it identifies the account even when no
+  // attribute search can find it.
+  if (askedSub) {
+    try {
+      attributeHit = await lookupBySubDirect(environment, askedSub);
+      if (!attributeHit) {
+        const byFilter = await lookupBySub(environment, askedSub);
+        attributeHit = byFilter[0] ?? null;
+      }
+    } catch (e) {
+      return { ...base, message: describeCognitoError(e, "AdminGetUser") };
+    }
+    if (!attributeHit) {
+      return { ...base, message: `No Cognito account has sub ${askedSub}.` };
+    }
+    // The account's own attribute is the number we are asking about.
+    mobile10 = mobile10 || normalizeMobile(attributeHit.phone_number);
+  }
+
+  if (!mobile10) {
+    return {
+      ...base,
+      message:
+        "That account carries no usable phone attribute, so there is no number to check. Give a 10-digit mobile instead.",
+    };
+  }
+
+  if (!attributeHit) {
+    try {
+      const hits = await lookupByMobile(environment, mobile10);
+      attributeHit = hits[0] ?? null;
+      if (hits.length > 1) {
+        warnings.push(
+          `${hits.length} accounts carry ${displayMobile10(mobile10)} as their phone attribute. Showing the first; repair the rest one at a time by sub.`,
+        );
+      }
+    } catch (e) {
+      return { ...base, mobile10, message: describeCognitoError(e, "ListUsers") };
+    }
+  }
+
+  let signinHit: CognitoUserInfo | null;
+  try {
+    signinHit = await lookupByReservedMobile(environment, mobile10);
+  } catch (e) {
+    return { ...base, mobile10, message: describeCognitoError(e, "AdminGetUser") };
+  }
+
+  const attributeAccount = attributeHit ? toMobileAccount(attributeHit) : null;
+  const signinAccount = signinHit ? toMobileAccount(signinHit) : null;
+
+  let verdict: SigninIndexVerdict;
+  if (!attributeAccount && !signinAccount) verdict = "free";
+  else if (attributeAccount && !signinAccount) verdict = "attribute-only";
+  else if (!attributeAccount && signinAccount) verdict = "reserved-only";
+  else if (attributeAccount!.sub && attributeAccount!.sub === signinAccount!.sub)
+    verdict = "aligned";
+  else verdict = "conflict";
+
+  // Who depends on this account? Shown so nobody repairs a number that a live
+  // record does not actually belong to.
+  let owners: CorrectionReleaseOwner[] = [];
+  const ownerSub = attributeAccount?.sub ?? signinAccount?.sub ?? null;
+  if (ownerSub) {
+    try {
+      owners = (await findCognitoHolders(environment, [ownerSub])).map((h) => ({
+        db: h.db,
+        table: h.table,
+        id: h.id,
+        name: h.name,
+        shortCode: h.shortCode,
+      }));
+    } catch (e) {
+      warnings.push(
+        `Could not check which records store this account's cognito_id: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
+  const blockers: string[] = [];
+  if (verdict === "aligned") {
+    blockers.push(
+      `${displayMobile10(mobile10)} already signs in as ${describeAccount(attributeAccount!)}. Both indexes agree — there is nothing to repair here, and the login failure has another cause.`,
+    );
+  } else if (verdict === "free") {
+    blockers.push(
+      `${displayMobile10(mobile10)} is not known to either index — no account carries it and nothing signs in with it. A fresh signup will create the account normally.`,
+    );
+  } else if (verdict === "reserved-only") {
+    blockers.push(
+      `${displayMobile10(mobile10)} signs in as ${describeAccount(signinAccount!)}, whose phone attribute says something else. That is the release-didn't-take direction — use the “Reserved mobile number” card above, not this one.`,
+    );
+  } else if (verdict === "conflict") {
+    blockers.push(
+      `Two different accounts are involved: ${displayMobile10(mobile10)} signs in as ${describeAccount(signinAccount!)}, but ${describeAccount(attributeAccount!)} carries it as an attribute. Repairing here would try to move a live sign-in name — reconcile the two accounts by hand first.`,
+    );
+  }
+
+  if (verdict === "attribute-only" && attributeAccount?.enabled === false) {
+    warnings.push(
+      "The account is DISABLED. Repairing the sign-in index will not by itself let the user log in — re-enable it too.",
+    );
+  }
+
+  const state = (
+    extra: Partial<CorrectionSigninMismatchResult>,
+  ): CorrectionSigninMismatchResult => ({
+    ...base,
+    mobile10,
+    verdict,
+    attributeAccount,
+    signinAccount,
+    owners,
+    blockers,
+    warnings,
+    ...extra,
+  });
+
+  if (preview) {
+    return state({
+      ok: true,
+      preview: true,
+      message:
+        blockers.length > 0
+          ? "Nothing to repair — see below."
+          : `${displayMobile10(mobile10)} is carried by ${describeAccount(attributeAccount!)} but signs in nowhere, so the console shows the number while every login for it throws UserNotFoundException. Repairing re-asserts that account's phone attribute with phone_number_verified="true", which is the documented condition for the number to become the sign-in name again.`,
+    });
+  }
+
+  if (blockers.length > 0) {
+    return state({ message: `Blocked: ${blockers.join(" ")}` });
+  }
+
+  const username = attributeHit?.username;
+  if (!username) {
+    return state({
+      message: "The account has no username to write to — repair it manually.",
+    });
+  }
+
+  const attempts: CorrectionSigninRepairAttempt[] = [];
+  try {
+    await updateUserPhone(environment, username, mobile10);
+    const after = await lookupByReservedMobile(environment, mobile10);
+    const repaired = after !== null && after.sub === attributeAccount!.sub;
+    attempts.push({
+      kind: "reassert-verified",
+      wrote: `+91${mobile10}`,
+      repaired,
+      detail: repaired
+        ? "Re-asserting the phone attribute as verified promoted it back to the account's sign-in name."
+        : after === null
+          ? "The attribute was re-written but the number still signs in nowhere. In this pool the sign-in identifier may be permanent, in which case the account cannot be reached by this number at all — escalate with the sub below."
+          : `The number now signs in as ${describeAccount(toMobileAccount(after))}, which is NOT this account. Do not retry.`,
+    });
+  } catch (e) {
+    return state({
+      attempts,
+      message: describeCognitoError(e, "AdminUpdateUserAttributes"),
+    });
+  }
+
+  const repaired = attempts.some((a) => a.repaired);
+  console.log("[signin-mismatch]", environment, mobile10, {
+    sub: attributeAccount?.sub,
+    verdict,
+    attempts,
+    repaired,
+  });
+
+  return state({
+    ok: repaired,
+    repaired,
+    attempts,
+    message: repaired
+      ? `${displayMobile10(mobile10)} signs in again as ${describeAccount(attributeAccount!)} — verified with AdminGetUser. Login, OTP and the passwordless flow should all work now.`
+      : `${displayMobile10(mobile10)} still does not sign in. Nothing else was changed — read the attempt detail before retrying.`,
   });
 }

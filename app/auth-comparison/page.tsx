@@ -7,6 +7,7 @@ import { AppHeader } from "@/components/app-header";
 import { Segmented } from "@/components/segmented";
 import { DataCorrectionCard } from "@/components/data-correction-card";
 import { ReservedNumberCard } from "@/components/reserved-number-card";
+import { SigninMismatchCard } from "@/components/signin-mismatch-card";
 import { type Environment } from "@/lib/types";
 
 /**
@@ -16,8 +17,12 @@ import { type Environment } from "@/lib/types";
  *   1. "Compare Auth / Corp / Cognito" — corp-driven, mobile-keyed comparison
  *      of one employee across corp / auth / Cognito. Display-only: the write
  *      actions live in the code but are gated off (see `lib/write-guard.ts`).
- *   2. "Reserved mobile number" — the reserved sign-in-identifier tool, the
- *      only path here that still writes (releasing a number back).
+ *   2. "Reserved mobile number" — the reserved sign-in-identifier tool.
+ *   3. "Sign-in number mismatch" — the inverse of (2): an account whose number
+ *      shows on the console but signs in nowhere.
+ *
+ * (2) and (3) are the only paths here that still write, and both write to the
+ * Cognito sign-in index rather than to any of our own tables.
  *
  * The former bulk "Compare" and "Employee ↔ Cognito Check" cards were removed;
  * their read-only API routes (`/api/auth-comparison/fetch`,
@@ -94,6 +99,13 @@ export default function AuthComparisonPage() {
         {/* Reserved mobile number (Cognito sign-in index) */}
         <ReservedNumberCard
           key={`reserved-${environment}`}
+          environment={environment}
+          onSessionExpired={handleSessionExpired}
+        />
+
+        {/* Sign-in number mismatch (the inverse divergence) */}
+        <SigninMismatchCard
+          key={`signin-${environment}`}
           environment={environment}
           onSessionExpired={handleSessionExpired}
         />

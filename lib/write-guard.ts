@@ -23,9 +23,11 @@
  * halves to disagree.
  *
  * NOT covered by this switch: the **Reserved mobile number** card
- * (`releaseReservedNumber`, `correction/release-number`). That one stays live —
- * it is the tool for freeing a mobile stuck in Cognito's sign-in index, which
- * is the whole reason it exists, and it writes only a Cognito phone attribute.
+ * (`releaseReservedNumber`, `correction/release-number`) and its inverse, the
+ * **Sign-in number mismatch** card (`repairSigninMismatch`,
+ * `correction/signin-mismatch`). Both stay live — they are the tools for a
+ * mobile stuck in Cognito's sign-in index, which is the whole reason they
+ * exist, and both write only a Cognito phone attribute.
  */
 export const CORRECTION_WRITES_ENABLED: boolean = false;
 

@@ -182,6 +182,37 @@ export async function lookupByReservedMobile(
 }
 
 /**
+ * The account a `sub` identifies, read through `AdminGetUser` rather than a
+ * `ListUsers` filter.
+ *
+ * Valid because this pool is `UsernameAttributes: ['phone_number']`, where the
+ * AWS docs state "the SignUp API populates the username attribute with a UUID
+ * … this UUID has the same value as the sub claim". So the sub IS the username
+ * here and `AdminGetUser` accepts it directly.
+ *
+ * Why it matters: `lookupBySub` filters the attribute index and is eventually
+ * consistent; this is an immediate, authoritative read of the account record,
+ * and it works even when the account is invisible to every attribute search.
+ * Returns `null` when no such account exists.
+ */
+export async function lookupBySubDirect(
+  environment: Environment,
+  sub: string,
+): Promise<CognitoUserInfo | null> {
+  const cfg = resolveConfig(environment);
+  const client = getClient(cfg);
+  try {
+    const res = await client.send(
+      new AdminGetUserCommand({ UserPoolId: cfg.userPoolId, Username: sub }),
+    );
+    return parseUser(res);
+  } catch (err) {
+    if (err instanceof Error && err.name === "UserNotFoundException") return null;
+    throw err;
+  }
+}
+
+/**
  * The placeholder number auth-backend parks on an account that must give up
  * its real mobile — a literal port of `generateRandomPhoneNumber` in
  * `auth-backend/src/utils/aws.ts`, deliberately keeping the same `1` + 9-digit

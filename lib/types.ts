@@ -756,6 +756,68 @@ export type CorrectionReleaseAttempt = {
   detail: string;
 };
 
+/**
+ * Which of the pool's two indexes know this number.
+ *
+ * The pool is `UsernameAttributes: ['phone_number']`, so a number lives in two
+ * places that can drift apart: the SIGN-IN index (`AdminGetUser`, the only
+ * thing `InitiateAuth` agrees with) and the editable `phone_number` ATTRIBUTE
+ * (`ListUsers`, console search, every app query).
+ */
+export type SigninIndexVerdict =
+  /** Both indexes agree. Nothing to repair. */
+  | "aligned"
+  /**
+   * An account carries the number as its attribute but the number signs in
+   * nowhere. This is the counter-mobile-change bug: the attribute was rewritten
+   * and the sign-in name never followed, so the console shows the number while
+   * login 404s.
+   */
+  | "attribute-only"
+  /**
+   * The number signs in, but its holder's attribute says something else — the
+   * release-didn't-take direction. Handled by the Reserved mobile number card.
+   */
+  | "reserved-only"
+  /** The two indexes resolve to DIFFERENT accounts. */
+  | "conflict"
+  /** Neither index knows the number. */
+  | "free";
+
+/** One attempt at making a carried number sign in again. */
+export type CorrectionSigninRepairAttempt = {
+  /**
+   * Re-write the account's phone attribute to the value it already carries,
+   * with `phone_number_verified` as the lowercase `"true"` the API documents.
+   * A sign-in name is only promoted on a verified update, so this is the
+   * documented lever for an index left behind by a write that used `"True"`.
+   */
+  kind: "reassert-verified";
+  wrote: string;
+  /** Whether the number signed in after this attempt — observed, not assumed. */
+  repaired: boolean;
+  detail: string;
+};
+
+export type CorrectionSigninMismatchResult = {
+  ok: boolean;
+  message: string;
+  mobile10: string | null;
+  verdict: SigninIndexVerdict;
+  /** Found via the `phone_number` attribute — what the console shows. */
+  attributeAccount: CorrectionMobileAccount | null;
+  /** What the number actually signs in as. */
+  signinAccount: CorrectionMobileAccount | null;
+  /** Rows storing the account's sub (corp empmaster_hdr + the 5 auth tables). */
+  owners: CorrectionReleaseOwner[];
+  attempts: CorrectionSigninRepairAttempt[];
+  /** Verified state at the end: can the number sign in again? */
+  repaired: boolean;
+  blockers: string[];
+  warnings: string[];
+  preview: boolean;
+};
+
 export type CorrectionReleaseNumberResult = {
   ok: boolean;
   message: string;
