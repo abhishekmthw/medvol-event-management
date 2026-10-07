@@ -65,6 +65,15 @@ export default function CounterEventsPage() {
   const [rawLoading, setRawLoading] = useState(false);
   const [rawResult, setRawResult] = useState<CounterQueryResult | null>(null);
   const [rawError, setRawError] = useState<string | null>(null);
+  // The exact request that produced `rawResult`, so the full-CSV re-fetch
+  // queries the same target/streams even if the inputs were edited since.
+  const [rawQuery, setRawQuery] = useState<{
+    environment: Environment;
+    service: Service;
+    instance: string | null;
+    streamIds: string;
+  } | null>(null);
+  const [rawDownloading, setRawDownloading] = useState(false);
 
   const isProd = environment === "prod";
   const showDivision = view !== "stockist";
@@ -255,16 +264,18 @@ export default function CounterEventsPage() {
     setRawLoading(true);
     setRawError(null);
     setRawResult(null);
+    setRawQuery(null);
+    const query = {
+      environment: rawEnv,
+      service: rawService,
+      instance: rawInstance,
+      streamIds: rawStreamInput,
+    };
     try {
       const res = await fetch("/api/counter/raw-events", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          environment: rawEnv,
-          service: rawService,
-          instance: rawInstance,
-          streamIds: rawStreamInput,
-        }),
+        body: JSON.stringify(query),
       });
       if (res.status === 401) {
         await handleSessionExpired();
@@ -276,6 +287,7 @@ export default function CounterEventsPage() {
         return;
       }
       setRawResult(data as CounterQueryResult);
+      setRawQuery(query);
     } catch (e) {
       setRawError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -283,16 +295,53 @@ export default function CounterEventsPage() {
     }
   }
 
-  function handleRawDownloadCsv() {
-    if (!rawResult || !rawResult.rows.length) return;
-    const csv = rowsToCsv(rawResult.columns, rawResult.rows);
+  async function handleRawDownloadCsv() {
+    if (!rawResult || !rawResult.rows.length || !rawQuery) return;
+    let full: CounterQueryResult = rawResult;
+    // The table is capped at 1000 rows; the CSV always carries every event on
+    // the streams, so re-fetch uncapped when the on-screen result was cut off.
+    if (rawResult.truncated) {
+      setRawDownloading(true);
+      setRawError(null);
+      try {
+        const res = await fetch("/api/counter/raw-events", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ...rawQuery, all: true }),
+        });
+        if (res.status === 401) {
+          await handleSessionExpired();
+          return;
+        }
+        const data = await res.json();
+        if (!res.ok) {
+          setRawError(
+            `Full CSV export failed: ${data?.error ?? `HTTP ${res.status}`}`,
+          );
+          return;
+        }
+        full = data as CounterQueryResult;
+      } catch (e) {
+        setRawError(
+          `Full CSV export failed: ${e instanceof Error ? e.message : String(e)}`,
+        );
+        return;
+      } finally {
+        setRawDownloading(false);
+      }
+    }
+    const csv = rowsToCsv(full.columns, full.rows);
     // Prepend a UTF-8 BOM (U+FEFF) so Excel detects the encoding correctly.
     const bom = String.fromCharCode(0xfeff);
     const blob = new Blob([bom + csv], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = rawCsvFilename(rawEnv, rawService, rawInstance);
+    a.download = rawCsvFilename(
+      rawQuery.environment,
+      rawQuery.service,
+      rawQuery.instance,
+    );
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
@@ -719,7 +768,7 @@ export default function CounterEventsPage() {
               {rawResult.truncated && (
                 <span
                   className="pill bg-amber-500/15 text-amber-600 dark:text-amber-400"
-                  title="Result set hit the row cap — narrow to fewer streams to see the rest."
+                  title="Table shows the first 1000 rows — Download CSV exports every event on the streams."
                 >
                   <AlertTriangle className="h-3 w-3" />
                   showing first 1000
@@ -733,11 +782,15 @@ export default function CounterEventsPage() {
                   type="button"
                   className="btn-ghost h-8 text-xs px-2.5"
                   onClick={handleRawDownloadCsv}
-                  disabled={rawResult.rows.length === 0}
-                  title="Download the fetched events as a CSV file (payload in one column)."
+                  disabled={rawResult.rows.length === 0 || rawDownloading}
+                  title="Download every event on the streams as a CSV file (payload in one column)."
                 >
-                  <Download className="h-3.5 w-3.5" />
-                  Download CSV
+                  {rawDownloading ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Download className="h-3.5 w-3.5" />
+                  )}
+                  {rawDownloading ? "Preparing CSV…" : "Download CSV"}
                 </button>
               </div>
             </div>

@@ -16,6 +16,8 @@ type Body = {
   instance?: string | null;
   /** Raw stream-id text (comma/space/newline separated). */
   streamIds?: string;
+  /** Skip the on-screen row cap and return every event (CSV export). */
+  all?: boolean;
 };
 
 export async function POST(req: Request) {
@@ -73,7 +75,7 @@ export async function POST(req: Request) {
   const target: Target = { environment, service, instance };
 
   try {
-    const result = await queryRawEvents(target, streamIds);
+    const result = await queryRawEvents(target, streamIds, { all: body.all === true });
     return NextResponse.json(result);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);

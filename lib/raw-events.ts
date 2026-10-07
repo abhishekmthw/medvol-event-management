@@ -18,7 +18,11 @@ import type { CounterColumn, CounterQueryResult, Target } from "./types";
  * identically against every Corp/OMS/private-instance database.
  */
 
-/** Hard cap on rows returned to the UI (guards against runaway result sets). */
+/**
+ * Hard cap on rows returned to the on-screen table (guards against runaway
+ * result sets). The CSV export passes `all: true` to bypass it and dump every
+ * event on the requested streams.
+ */
 const ROW_LIMIT = 1000;
 
 /**
@@ -43,12 +47,14 @@ export const RAW_EVENT_COLUMNS: CounterColumn[] = [
 
 /**
  * Fetches every event on the given stream IDs for the target, newest first.
- * `data` / `userDetails` are cast to text (`::text`) so `pg` hands back a JSON
+ * Capped at ROW_LIMIT unless `opts.all` is set (CSV export), in which case
+ * every matching row is returned. `data` / `userDetails` are cast to text (`::text`) so `pg` hands back a JSON
  * string ready for both the table and the CSV — no server-side stringify.
  */
 export async function queryRawEvents(
   target: Target,
   streamIds: string[],
+  opts: { all?: boolean } = {},
 ): Promise<CounterQueryResult> {
   if (!streamIds.length) {
     return {
@@ -79,11 +85,12 @@ export async function queryRawEvents(
     FROM public.events e
     WHERE e."eventStreamStreamId" = ANY($1::text[])
     ORDER BY e."eventStreamStreamId", e.timestamp DESC
-    LIMIT $2
+    ${opts.all ? "" : "LIMIT $2"}
   `;
-  const { rows } = await pool.query(sql, [streamIds, ROW_LIMIT + 1]);
+  const params: unknown[] = opts.all ? [streamIds] : [streamIds, ROW_LIMIT + 1];
+  const { rows } = await pool.query(sql, params);
 
-  const truncated = rows.length > ROW_LIMIT;
+  const truncated = !opts.all && rows.length > ROW_LIMIT;
   const out = (truncated ? rows.slice(0, ROW_LIMIT) : rows) as Record<
     string,
     unknown
