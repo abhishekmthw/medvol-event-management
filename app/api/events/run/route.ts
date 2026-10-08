@@ -32,6 +32,8 @@ type Body = {
   instance?: string | null;
   input?: string;
   preview?: boolean;
+  /** execute-expired-events only: halt at the first failed call. */
+  stopOnFailure?: boolean;
 };
 
 export async function POST(req: Request) {
@@ -91,6 +93,7 @@ export async function POST(req: Request) {
 
   const target: Target = { environment, service, instance };
   const preview = Boolean(body.preview);
+  const stopOnFailure = Boolean(body.stopOnFailure);
 
   try {
     let result;
@@ -108,7 +111,10 @@ export async function POST(req: Request) {
         result = await clearBatchEvents(target, input, { preview });
         break;
       case "execute-expired-events":
-        result = await executeExpiredEvents(target, input, { preview });
+        result = await executeExpiredEvents(target, input, {
+          preview,
+          stopOnFailure,
+        });
         break;
       case "status":
         result = await checkStatus(target, input);

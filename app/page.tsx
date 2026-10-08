@@ -77,6 +77,9 @@ export default function DashboardPage() {
   const [result, setResult] = useState<OperationResult | null>(null);
   const [topError, setTopError] = useState<string | null>(null);
   const [formatOpen, setFormatOpen] = useState(false);
+  // Execute Expired Events: halt at the first failed call so later events on
+  // the same stream are never applied out of order.
+  const [stopOnFailure, setStopOnFailure] = useState(true);
 
   const handleSessionExpired = useMemo(
     () => async () => {
@@ -147,6 +150,7 @@ export default function DashboardPage() {
           instance,
           input,
           preview,
+          stopOnFailure,
         }),
       });
       if (res.status === 401) {
@@ -324,37 +328,51 @@ export default function DashboardPage() {
                   ? "Preview will show the exact request built for each event before anything is sent."
                   : "Preview will show affected rows before any database change."}
             </p>
-            <button
-              type="button"
-              className={clsx(
-                isDestructive && isProd ? "btn-danger" : "btn-primary",
-                "min-w-[150px]",
+            <div className="flex flex-wrap items-center gap-3">
+              {action === "execute-expired-events" && (
+                <label className="flex items-center gap-2 text-xs cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4 accent-[hsl(var(--primary))]"
+                    checked={stopOnFailure}
+                    onChange={(e) => setStopOnFailure(e.target.checked)}
+                    disabled={loading || previewing}
+                  />
+                  Stop on first failure
+                </label>
               )}
-              onClick={handleExecute}
-              disabled={loading || previewing || !input.trim()}
-            >
-              {previewing ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Previewing…
-                </>
-              ) : loading ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Running…
-                </>
-              ) : isDestructive ? (
-                <>
-                  <Eye className="h-4 w-4" />
-                  Preview & Run
-                </>
-              ) : (
-                <>
-                  Execute
-                  <ChevronRight className="h-4 w-4" />
-                </>
-              )}
-            </button>
+              <button
+                type="button"
+                className={clsx(
+                  isDestructive && isProd ? "btn-danger" : "btn-primary",
+                  "min-w-[150px]",
+                )}
+                onClick={handleExecute}
+                disabled={loading || previewing || !input.trim()}
+              >
+                {previewing ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Previewing…
+                  </>
+                ) : loading ? (
+                  <>
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Running…
+                  </>
+                ) : isDestructive ? (
+                  <>
+                    <Eye className="h-4 w-4" />
+                    Preview & Run
+                  </>
+                ) : (
+                  <>
+                    Execute
+                    <ChevronRight className="h-4 w-4" />
+                  </>
+                )}
+              </button>
+            </div>
           </div>
         </section>
 

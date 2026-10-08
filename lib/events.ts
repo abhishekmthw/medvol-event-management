@@ -733,7 +733,7 @@ function resolveExecuteRow(
 export async function executeExpiredEvents(
   target: Target,
   input: string,
-  options: { preview?: boolean } = {},
+  options: { preview?: boolean; stopOnFailure?: boolean } = {},
 ): Promise<OperationResult> {
   const { eventIds, streamIds } = partitionIdentifiers(input);
   const errors: OperationResult["errors"] = streamIds.map((t) => ({
@@ -808,6 +808,9 @@ export async function executeExpiredEvents(
     } else if (notFailed) {
       parts.push(`${notFailed} ${notFailed === 1 ? "is" : "are"} not in Failed state.`);
     }
+    if (options.stopOnFailure && runnable.length > 1) {
+      parts.push("The run stops at the first event that fails; later events are not sent.");
+    }
 
     return {
       ok: true,
@@ -832,10 +835,22 @@ export async function executeExpiredEvents(
 
   let succeeded = 0;
   let dbUpdated = 0;
+  let sent = 0;
+  let stoppedAt: string | null = null;
 
   // Strictly one at a time, in ascending event-ID order (the fetch sorts
   // them): later events on a stream may depend on earlier ones landing first.
   for (const { row, input: ev } of runnable) {
+    if (stoppedAt !== null) {
+      row.warnings.push(`Not sent — the run stopped after event ${stoppedAt} failed.`);
+      errors.push({
+        id: row.event_id,
+        reason: `Not sent: the run stopped after event ${stoppedAt} failed.`,
+      });
+      continue;
+    }
+
+    sent++;
     const req = buildConsumerRequest(target, ev, cfg);
     const out = await callConsumerApi(req);
     row.http_status = out.status;
@@ -853,6 +868,9 @@ export async function executeExpiredEvents(
         id: row.event_id,
         reason: `HTTP ${out.status ?? "—"}: ${truncateResponse(out.raw) || "<empty>"} — full curl on the row below.`,
       });
+      // Only a failed call stops the run: a consumer-status update failure
+      // below still means the event itself was applied.
+      if (options.stopOnFailure) stoppedAt = row.event_id;
       continue;
     }
 
@@ -878,15 +896,20 @@ export async function executeExpiredEvents(
     }
   }
 
-  const failedCalls = runnable.length - succeeded;
+  const failedCalls = sent - succeeded;
+  const notSent = runnable.length - sent;
   const message = runnable.length
-    ? `Executed ${runnable.length} event${runnable.length === 1 ? "" : "s"}: ${succeeded} succeeded, ${failedCalls} failed. ${dbUpdated} consumer-status row${dbUpdated === 1 ? "" : "s"} marked Success.`
+    ? `Executed ${sent} event${sent === 1 ? "" : "s"}: ${succeeded} succeeded, ${failedCalls} failed. ${dbUpdated} consumer-status row${dbUpdated === 1 ? "" : "s"} marked Success.${
+        stoppedAt !== null && notSent > 0
+          ? ` Stopped after event ${stoppedAt} failed — ${notSent} later event${notSent === 1 ? " was" : "s were"} not sent.`
+          : ""
+      }`
     : "No event could be replayed — nothing was sent.";
 
   return {
     ok: errors.length === 0,
     message,
-    attempted: runnable.length,
+    attempted: sent,
     cleared: succeeded,
     errors,
     executed: rows,
