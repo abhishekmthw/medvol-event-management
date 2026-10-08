@@ -49,7 +49,7 @@ const ALL_ROLE_IDS: readonly string[] = [
   ...SPECIFIC_COMPANY_ROLE_IDS,
 ];
 
-/** Matches `EXECUTE_CONCURRENCY` in `lib/events.ts` — the other bulk HTTP action. */
+/** Pushes in flight at once — each user's ADMIN_EDIT is independent. */
 const PUSH_CONCURRENCY = 4;
 
 /**

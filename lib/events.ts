@@ -545,9 +545,6 @@ export async function clearBatchEvents(
  */
 const MAX_EXECUTE_IDS = 50;
 
-/** How many events are in flight at once (the script used a batch of 5). */
-const EXECUTE_CONCURRENCY = 4;
-
 /** Response bodies are echoed to the UI — cap what we carry per row. */
 const RESPONSE_PREVIEW_LIMIT = 2000;
 
@@ -836,52 +833,49 @@ export async function executeExpiredEvents(
   let succeeded = 0;
   let dbUpdated = 0;
 
-  for (let i = 0; i < runnable.length; i += EXECUTE_CONCURRENCY) {
-    const batch = runnable.slice(i, i + EXECUTE_CONCURRENCY);
-    await Promise.all(
-      batch.map(async ({ row, input: ev }) => {
-        const req = buildConsumerRequest(target, ev, cfg);
-        const out = await callConsumerApi(req);
-        row.http_status = out.status;
-        row.response = truncateResponse(out.raw);
+  // Strictly one at a time, in ascending event-ID order (the fetch sorts
+  // them): later events on a stream may depend on earlier ones landing first.
+  for (const { row, input: ev } of runnable) {
+    const req = buildConsumerRequest(target, ev, cfg);
+    const out = await callConsumerApi(req);
+    row.http_status = out.status;
+    row.response = truncateResponse(out.raw);
 
-        if (!out.ok) {
-          // Handed to the operator with credentials intact so the exact
-          // request can be replayed in Postman; the server log keeps them
-          // redacted.
-          row.curl = out.curl;
-          console.error(
-            `[execute-expired-events] ${row.event_id} failed: HTTP ${out.status ?? "network"} ${out.raw}\n${buildCurl(req, { redact: true })}`,
-          );
-          errors.push({
-            id: row.event_id,
-            reason: `HTTP ${out.status ?? "—"}: ${truncateResponse(out.raw) || "<empty>"} — full curl on the row below.`,
-          });
-          return;
-        }
+    if (!out.ok) {
+      // Handed to the operator with credentials intact so the exact
+      // request can be replayed in Postman; the server log keeps them
+      // redacted.
+      row.curl = out.curl;
+      console.error(
+        `[execute-expired-events] ${row.event_id} failed: HTTP ${out.status ?? "network"} ${out.raw}\n${buildCurl(req, { redact: true })}`,
+      );
+      errors.push({
+        id: row.event_id,
+        reason: `HTTP ${out.status ?? "—"}: ${truncateResponse(out.raw) || "<empty>"} — full curl on the row below.`,
+      });
+      continue;
+    }
 
-        succeeded++;
-        // 2xx — mark the consumer-status row Success. SQS is deliberately left
-        // alone for this action.
-        try {
-          const updated = await markEventForceSuccess(target, row.event_id);
-          row.db_updated = updated > 0;
-          if (updated > 0) dbUpdated++;
-          else {
-            row.warnings.push(
-              "Call succeeded but no V2 consumer-status row existed to update.",
-            );
-          }
-        } catch (e) {
-          errors.push({
-            id: row.event_id,
-            reason: `Call succeeded (HTTP ${out.status}) but the consumer-status update failed: ${
-              e instanceof Error ? e.message : String(e)
-            }`,
-          });
-        }
-      }),
-    );
+    succeeded++;
+    // 2xx — mark the consumer-status row Success. SQS is deliberately left
+    // alone for this action.
+    try {
+      const updated = await markEventForceSuccess(target, row.event_id);
+      row.db_updated = updated > 0;
+      if (updated > 0) dbUpdated++;
+      else {
+        row.warnings.push(
+          "Call succeeded but no V2 consumer-status row existed to update.",
+        );
+      }
+    } catch (e) {
+      errors.push({
+        id: row.event_id,
+        reason: `Call succeeded (HTTP ${out.status}) but the consumer-status update failed: ${
+          e instanceof Error ? e.message : String(e)
+        }`,
+      });
+    }
   }
 
   const failedCalls = runnable.length - succeeded;
