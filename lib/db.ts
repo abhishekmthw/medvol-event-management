@@ -1,5 +1,6 @@
 import { Pool } from "pg";
 import { getInstance } from "./instances";
+import { RDS_AP_SOUTH_1_CA } from "./rds-ca";
 import type { Environment, Service, Target } from "./types";
 
 type PoolKey = string;
@@ -20,6 +21,27 @@ function creds(prefix: string): EnvCreds {
     database: process.env[`${prefix}_DB_NAME`],
     password: process.env[`${prefix}_DB_PASSWORD`],
   };
+}
+
+/** Environments whose clusters require TLS (Aurora PG 17, rds.force_ssl=1). */
+const SSL_ENVIRONMENTS: ReadonlySet<Environment> = new Set(["stage"]);
+
+/**
+ * TLS for every pool of the given environment — shared Corp/OMS, private
+ * instances and the auth DB alike. Currently only stage: its clusters run
+ * Aurora PostgreSQL 17, which defaults `rds.force_ssl` to 1 and refuses
+ * plaintext with "no pg_hba.conf entry for host ..., no encryption". Prod stays
+ * plaintext until its clusters are upgraded — add "prod" to SSL_ENVIRONMENTS
+ * then.
+ *
+ * Verification matches the connect host against the certificate, so the
+ * `*_DB_HOST` values must be the real RDS endpoints — never a CNAME, alias or IP.
+ */
+function sslConfig(
+  environment: Environment,
+): false | { rejectUnauthorized: true; ca: string } {
+  if (!SSL_ENVIRONMENTS.has(environment)) return false;
+  return { rejectUnauthorized: true, ca: RDS_AP_SOUTH_1_CA };
 }
 
 /**
@@ -77,6 +99,7 @@ export function getPool(target: Target): Pool {
     host: c.host,
     database: c.database,
     password: c.password,
+    ssl: sslConfig(target.environment),
     port: 5432,
     max: 5,
     idleTimeoutMillis: 30_000,
@@ -131,6 +154,7 @@ export function getAuthPool(environment: Environment): Pool {
     host: c.host,
     database: c.database,
     password: c.password,
+    ssl: sslConfig(environment),
     port: 5432,
     max: 5,
     idleTimeoutMillis: 30_000,
