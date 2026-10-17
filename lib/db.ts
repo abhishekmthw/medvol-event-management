@@ -23,16 +23,19 @@ function creds(prefix: string): EnvCreds {
   };
 }
 
-/** Environments whose clusters require TLS (Aurora PG 17, rds.force_ssl=1). */
-const SSL_ENVIRONMENTS: ReadonlySet<Environment> = new Set(["stage"]);
+/** Environments whose pools connect over TLS. */
+const SSL_ENVIRONMENTS: ReadonlySet<Environment> = new Set(["stage", "prod"]);
 
 /**
  * TLS for every pool of the given environment — shared Corp/OMS, private
- * instances and the auth DB alike. Currently only stage: its clusters run
- * Aurora PostgreSQL 17, which defaults `rds.force_ssl` to 1 and refuses
- * plaintext with "no pg_hba.conf entry for host ..., no encryption". Prod stays
- * plaintext until its clusters are upgraded — add "prod" to SSL_ENVIRONMENTS
- * then.
+ * instances and the auth DB alike.
+ *
+ * Stage runs Aurora PostgreSQL 17, which defaults `rds.force_ssl` to 1 and
+ * refuses plaintext with "no pg_hba.conf entry for host ..., no encryption".
+ * Prod is enabled ahead of its own upgrade rather than after it: RDS serves
+ * certificates on every engine version, so this works against PG 14 today, and
+ * going into the upgrade already encrypted means it cannot lock the tool out
+ * whichever way `rds.force_ssl` lands on the new parameter group.
  *
  * Verification matches the connect host against the certificate, so the
  * `*_DB_HOST` values must be the real RDS endpoints — never a CNAME, alias or IP.
